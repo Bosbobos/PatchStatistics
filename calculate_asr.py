@@ -12,10 +12,10 @@ MODEL_PATH       = "nanodet_plus_62_192.onnx"
 IMAGE_DIR        = "dataset"
 CLASSES_PATH     = None
 CONF_THRESHOLD   = 0.3
-PATCH_SIZE       = 0.4
+PATCH_SIZE       = 0.5
 PATCH_NAME       = "dpatch5000"
 PATCH_PATH       = PATCH_NAME + ".png"
-RESULTS_DIR      = "results_" + PATCH_NAME
+RESULTS_DIR      = "results_" + 'corner_' + PATCH_NAME
 # ─────────────────────────────────
 
 def load_class_names(path):
