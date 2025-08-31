@@ -1,3 +1,4 @@
+import json
 import math
 import cv2
 import numpy as np
@@ -6,6 +7,9 @@ import torch
 import os
 from onnx2torch import convert
 from typing import Optional, List, Tuple, Dict, Any
+
+from tqdm import tqdm
+from ultralytics import YOLO
 
 
 # ─────────── Вспомогательные функции ───────────
@@ -141,25 +145,6 @@ def calculate_iou(box1: np.ndarray, box2: np.ndarray) -> float:
     return inter_area / union_area if union_area > 0 else 0
 
 
-def load_model(
-        model_path: str
-) -> Tuple[torch.nn.Module, int, int, int]:
-    onnx_model = onnx.load(model_path)
-
-    # Получаем размеры входа
-    input_shape = onnx_model.graph.input[0].type.tensor_type.shape
-    H = input_shape.dim[2].dim_value
-    W = input_shape.dim[3].dim_value
-
-    # Получаем размерность выхода
-    output_shape = onnx_model.graph.output[0].type.tensor_type.shape
-    D = output_shape.dim[2].dim_value
-    num_classes = D - 32  # 32 - количество смещений (offsets)
-
-    model = convert(onnx_model)
-    return model, H, W, num_classes
-
-
 def apply_patch(
         img: np.ndarray,
         boxes: np.ndarray,
@@ -262,33 +247,88 @@ def apply_patch(
     return patched
 
 
+def load_model(
+        model_path: str
+) -> Tuple[Any, int, int, int]:
+    """
+    Загружает модель YOLO или ONNX в зависимости от расширения файла
+    """
+    if model_path.endswith('.pt'):  # YOLO модель
+        # Для YOLO моделей возвращаем специальный кортеж
+        model = YOLO(model_path)
+        # Получаем информацию о входных размерах из модели
+        input_shape = model.model.args.get('imgsz', 640)  # стандартный размер для YOLOv8
+        if isinstance(input_shape, (list, tuple)):
+            H, W = input_shape
+        else:
+            H = W = input_shape
+
+        # Получаем количество классов
+        num_classes = model.model.nc
+
+        return (model, 'yolo'), H, W, num_classes
+
+    else:  # ONNX модель (оригинальная логика)
+        onnx_model = onnx.load(model_path)
+
+        # Получаем размеры входа
+        input_shape = onnx_model.graph.input[0].type.tensor_type.shape
+        H = input_shape.dim[2].dim_value
+        W = input_shape.dim[3].dim_value
+
+        # Получаем размерность выхода
+        output_shape = onnx_model.graph.output[0].type.tensor_type.shape
+        D = output_shape.dim[2].dim_value
+        num_classes = D - 32  # 32 - количество смещений (offsets)
+
+        model = convert(onnx_model)
+        return model, H, W, num_classes
+
+
+def yolo_detect(model, img: np.ndarray, conf_threshold: float = 0.3) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Детекция с использованием YOLO модели
+    """
+    results = model(img, conf=conf_threshold, verbose=False)
+
+    if len(results) == 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    result = results[0]
+    boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else np.array([])
+    scores = result.boxes.conf.cpu().numpy() if result.boxes is not None else np.array([])
+    class_ids = result.boxes.cls.cpu().numpy().astype(int) if result.boxes is not None else np.array([])
+
+    # Для совместимости с оригинальным интерфейсом создаем scores_all
+    if len(class_ids) > 0:
+        scores_all = np.zeros((len(class_ids), model.model.nc))
+        for i, class_id in enumerate(class_ids):
+            scores_all[i, class_id] = scores[i]
+    else:
+        scores_all = np.array([])
+
+    return boxes, scores, class_ids, scores_all
+
+
 def detect_and_compare(
-        model: torch.nn.Module,
+        model: Any,
         img: np.ndarray,
         orig_img: np.ndarray,
         patch_path: str,
         model_params: Dict[str, Any],
         target_class: int = 0,
         patch_size: float = 0.4,
+        threshold: float = 0.3,
         save_images: bool = True,
         save_dir: Optional[str] = None,
-        img_name:Optional[str] = None,
+        img_name: Optional[str] = None,
         out_of_box: bool = False,
         near_box: bool = False,
-) -> Tuple[int, int, List[float], Optional[np.ndarray]]:
+) -> Tuple[int, int, int, List[float], List[float], Optional[np.ndarray]]:
     """
-    Обрабатывает изображение: детектирует объекты, применяет патч, сравнивает результаты
-
-    :param model: модель детекции
-    :param img: исходное изображение
-    :param orig_img: оригинальное изображение (без изменений)
-    :param patch_path: путь к файлу патча
-    :param model_params: параметры модели и обработки
-    :param target_class: целевой класс для атаки
-    :param patch_size: относительный размер патча
-    :param save_images: сохранять ли результирующие изображения
-    :param save_dir: директория для сохранения изображений
-    :return: tuple (num_targets, num_success, confidence_drops, result_img)
+    Обрабатывает изображение: детектирует объекты, применяет патч и черный квадрат,
+    сравнивает результаты
     """
     # Извлекаем параметры модели
     H = model_params['H']
@@ -299,66 +339,114 @@ def detect_and_compare(
     conf_threshold = model_params['conf_threshold']
     num_classes = model_params['num_classes']
     class_names = model_params['class_names']
+    model_type = model_params.get('model_type', 'onnx')  # 'onnx' или 'yolo'
 
     orig_h, orig_w = img.shape[:2]
 
     # Детекция на исходном изображении
-    blob = preprocess(img, (H, W), mean, scale)
-    pred = model(torch.from_numpy(blob))[0].detach().numpy()
-    boxes, scores, class_ids, scores_all = postprocess(
-        pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
-    )
+    if model_type == 'yolo':
+        boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold)
+    else:
+        blob = preprocess(img, (H, W), mean, scale)
+        pred = model(torch.from_numpy(blob))[0].detach().numpy()
+        boxes, scores, class_ids, scores_all = postprocess(
+            pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
+        )
 
-    # Применяем патч к целевым объектам
+    # Применяем настоящий патч к целевым объектам
     patched_img = apply_patch(
         img, boxes, class_ids, target_class, patch_path, patch_size, out_of_box, near_box
     )
 
-    # Детекция на изображении с патчем
-    blob = preprocess(patched_img, (H, W), mean, scale)
-    pred = model(torch.from_numpy(blob))[0].detach().numpy()
-    boxes_p, scores_p, class_ids_p, scores_all_p = postprocess(
-        pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
+    # Применяем черный патч к целевым объектам
+    black_patch_path = 'black_patch.png'
+    black_patched_img = apply_patch(
+        img, boxes, class_ids, target_class, black_patch_path, patch_size, out_of_box, near_box
     )
+
+    # Детекция на изображении с настоящим патчем
+    if model_type == 'yolo':
+        boxes_p, scores_p, class_ids_p, scores_all_p = yolo_detect(model, patched_img, conf_threshold)
+        boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_detect(model, black_patched_img, conf_threshold)
+    else:
+        blob = preprocess(patched_img, (H, W), mean, scale)
+        pred = model(torch.from_numpy(blob))[0].detach().numpy()
+        boxes_p, scores_p, class_ids_p, scores_all_p = postprocess(
+            pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
+        )
+
+        blob = preprocess(black_patched_img, (H, W), mean, scale)
+        pred = model(torch.from_numpy(blob))[0].detach().numpy()
+        boxes_bp, scores_bp, class_ids_bp, scores_all_bp = postprocess(
+            pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
+        )
 
     # Собираем статистику по целевым объектам
     num_targets = 0
-    num_success = 0
-    confidence_drops = []
+    num_success_real = 0  # Успехи с настоящим патчем
+    num_success_black = 0  # Успехи с черным патчем
+    confidence_drops_real = []  # Падение уверенности с настоящим патчем
+    confidence_drops_black = []  # Падение уверенности с черным патчем
 
     target_indices = np.where(class_ids == target_class)[0]
     num_targets = len(target_indices)
 
     for idx in target_indices:
         orig_box = boxes[idx]
-        orig_score = scores_all[idx, target_class]
-        found = False
+        orig_score = scores_all[idx, target_class] if scores_all.size > 0 else 0
 
+        # Проверяем эффективность настоящего патча
+        found_real = False
         for j, patched_box in enumerate(boxes_p):
             if class_ids_p[j] == target_class:
                 iou = calculate_iou(orig_box, patched_box)
                 if iou > 0.5:
-                    found = True
-                    patched_score = scores_all_p[j, target_class]
+                    found_real = True
+                    patched_score = scores_all_p[j, target_class] if scores_all_p.size > 0 else 0
                     confidence_drop = orig_score - patched_score
-                    confidence_drops.append(confidence_drop)
+                    confidence_drops_real.append(confidence_drop)
 
-                    # Считаем успешной атакой если уверенность упала значительно
-                    if confidence_drop > 0.3:
-                        num_success += 1
+                    if orig_score > threshold and patched_score < threshold:
+                        num_success_real += 1
                     break
 
-        if not found:
-            confidence_drops.append(orig_score)
-            num_success += 1
+        if not found_real:
+            confidence_drops_real.append(orig_score)
+            num_success_real += 1
 
-    # Создаем side-by-side изображение
+        # Проверяем эффективность черного патча
+        found_black = False
+        for j, black_patched_box in enumerate(boxes_bp):
+            if class_ids_bp[j] == target_class:
+                iou = calculate_iou(orig_box, black_patched_box)
+                if iou > 0.5:
+                    found_black = True
+                    black_patched_score = scores_all_bp[j, target_class] if scores_all_bp.size > 0 else 0
+                    confidence_drop = orig_score - black_patched_score
+                    confidence_drops_black.append(confidence_drop)
+
+                    if orig_score > threshold and black_patched_score < threshold:
+                        num_success_black += 1
+                    break
+
+        if not found_black:
+            confidence_drops_black.append(orig_score)
+            num_success_black += 1
+
+    # Создаем side-by-side изображение с тремя панелями
     result_img = None
     if save_images or save_dir:
         # Визуализация результатов
         vis_clean = draw(orig_img.copy(), boxes, scores, class_ids, class_names)
         vis_patched = draw(patched_img.copy(), boxes_p, scores_p, class_ids_p, class_names)
-        result_img = np.hstack([vis_clean, vis_patched])
+        vis_black_patched = draw(black_patched_img.copy(), boxes_bp, scores_bp, class_ids_bp, class_names)
+
+        # Добавляем подписи
+        cv2.putText(vis_clean, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(vis_patched, "Real Patch", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(vis_black_patched, "Black Patch", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        result_img = np.hstack([vis_clean, vis_patched, vis_black_patched])
 
         if save_images and save_dir:
             result_path = os.path.join(
@@ -368,7 +456,7 @@ def detect_and_compare(
             cv2.imwrite(result_path, result_img)
             print(f"Result saved: {result_path}")
 
-    return num_targets, num_success, confidence_drops, result_img
+    return num_targets, num_success_real, num_success_black, confidence_drops_real, confidence_drops_black, result_img
 
 
 # ─────────── Основная логика ───────────
@@ -384,7 +472,7 @@ def run_experiment(
         target_class: int = 0,
         save_images: bool = True,
         out_of_box: bool = False,
-        near_box:bool = False,
+        near_box: bool = False,
 ) -> Dict[str, Any]:
     # Вычисляем производные пути
     patch_path = f"{patch_name}.png"
@@ -392,7 +480,15 @@ def run_experiment(
         results_dir = f"patched_{patch_name}" + ('_oob' if out_of_box else "") + ('_near_box' if near_box else '')
 
     # Загрузка модели
-    model, H, W, num_classes = load_model(model_path)
+    model_info, H, W, num_classes = load_model(model_path)
+
+    # Определяем тип модели
+    if isinstance(model_info, tuple) and model_info[1] == 'yolo':
+        model, model_type = model_info
+        model_type_str = 'yolo'
+    else:
+        model = model_info
+        model_type_str = 'onnx'
 
     # Загрузка имен классов
     class_names = load_class_names(classes_path)
@@ -411,19 +507,22 @@ def run_experiment(
         'strides': [8, 16, 32, 64],
         'conf_threshold': conf_threshold,
         'num_classes': num_classes,
-        'class_names': class_names
+        'class_names': class_names,
+        'model_type': model_type_str  # Добавляем тип модели
     }
 
-    # Статистика
+    # Статистика для обоих типов патчей
     total_targets = 0
-    successful_attacks = 0
-    confidence_drops = []
+    successful_attacks_real = 0
+    successful_attacks_black = 0
+    confidence_drops_real = []
+    confidence_drops_black = []
 
     # Обработка изображений
     image_files = [os.path.join(image_dir, f) for f in os.listdir(image_dir)
                    if f.lower().endswith(('.jpg', '.jpeg', '.png'))][:samples_num]
 
-    for image_file in image_files:
+    for image_file in tqdm(image_files, desc="Processing images"):
         # Загрузка изображения
         img = cv2.imread(image_file)
         if img is None:
@@ -431,7 +530,7 @@ def run_experiment(
             continue
 
         # Обработка изображения
-        num_targets, num_success, img_drops, _ = detect_and_compare(
+        num_targets, num_success_real, num_success_black, img_drops_real, img_drops_black, _ = detect_and_compare(
             model=model,
             img=img,
             orig_img=img.copy(),
@@ -448,37 +547,74 @@ def run_experiment(
 
         # Обновляем статистику
         total_targets += num_targets
-        successful_attacks += num_success
-        confidence_drops.extend(img_drops)
+        successful_attacks_real += num_success_real
+        successful_attacks_black += num_success_black
+        confidence_drops_real.extend(img_drops_real)
+        confidence_drops_black.extend(img_drops_black)
 
-        print(f"Processed {image_file}: targets={num_targets}, success={num_success}")
+        if num_targets > 0:
+            print(f"Processed {os.path.basename(image_file)}: "
+                  f"targets={num_targets}, "
+                  f"real_success={num_success_real} ({num_success_real / num_targets * 100:.1f}%), "
+                  f"black_success={num_success_black} ({num_success_black / num_targets * 100:.1f}%)")
 
     # Расчет итоговых метрик
     metrics = {
+        'model_path': model_path,
+        'patch_name': patch_name,
         'total_targets': total_targets,
-        'successful_attacks': successful_attacks,
-        'confidence_drops': confidence_drops
+        'successful_attacks_real': successful_attacks_real,
+        'successful_attacks_black': successful_attacks_black,
+        'target_class': target_class,
+        'target_class_name': class_names[target_class] if target_class < len(class_names) else 'unknown'
     }
 
     if total_targets > 0:
-        metrics['asr'] = successful_attacks / total_targets
-        metrics['mean_confidence_drop'] = np.mean(confidence_drops)
+        metrics['asr_real'] = successful_attacks_real / total_targets
+        metrics['asr_black'] = successful_attacks_black / total_targets
+        metrics['mean_confidence_drop_real'] = float(np.mean(confidence_drops_real))
+        metrics['mean_confidence_drop_black'] = float(np.mean(confidence_drops_black))
+        metrics['relative_effectiveness'] = metrics['asr_real'] - metrics['asr_black']
     else:
-        metrics['asr'] = 0.0
-        metrics['mean_confidence_drop'] = 0.0
+        metrics['asr_real'] = 0.0
+        metrics['asr_black'] = 0.0
+        metrics['mean_confidence_drop_real'] = 0.0
+        metrics['mean_confidence_drop_black'] = 0.0
+        metrics['relative_effectiveness'] = 0.0
+
+    # Сохранение результатов в файл
+    json_results_path = 'results'
+    os.makedirs(json_results_path, exist_ok=True)
+    results_file = os.path.join(json_results_path, f"{model_path.split('.')[0]}_{patch_name}.json")
+    with open(results_file, 'w') as f:
+        json.dump(metrics, f, indent=2)
 
     # Вывод результатов
-    print(f"\nAttack name: {patch_name}")
-    print(
-        f"Target class: {target_class} ({class_names[target_class] if target_class < len(class_names) else 'unknown'})")
+    print(f"\n{'=' * 60}")
+    print(f"EXPERIMENT RESULTS: {patch_name}")
+    print(f"{'=' * 60}")
+    print(f"Target class: {target_class} ({metrics['target_class_name']})")
     print(f"Total targets: {total_targets}")
-    print(f"Successful attacks: {successful_attacks}")
+    print(f"Successful attacks (real patch): {successful_attacks_real}")
+    print(f"Successful attacks (black patch): {successful_attacks_black}")
 
     if total_targets > 0:
-        print(f"ASR: {metrics['asr']:.4f}\n")
-        print(f"Mean confidence drop: {metrics['mean_confidence_drop']:.4f}")
+        print(f"\nASR (real patch): {metrics['asr_real']:.4f} ({metrics['asr_real'] * 100:.1f}%)")
+        print(f"ASR (black patch): {metrics['asr_black']:.4f} ({metrics['asr_black'] * 100:.1f}%)")
+        print(
+            f"Relative effectiveness: {metrics['relative_effectiveness']:.4f} ({metrics['relative_effectiveness'] * 100:.1f}%)")
+        print(f"\nMean confidence drop (real patch): {metrics['mean_confidence_drop_real']:.4f}")
+        print(f"Mean confidence drop (black patch): {metrics['mean_confidence_drop_black']:.4f}")
+
+        # Дополнительная статистика
+        if confidence_drops_real:
+            print(f"Max confidence drop (real): {np.max(confidence_drops_real):.4f}")
+            print(f"Min confidence drop (real): {np.min(confidence_drops_real):.4f}")
     else:
         print("No target objects found")
+
+    print(f"\nResults saved to: {results_file}")
+    print(f"{'=' * 60}")
 
     return metrics
 
@@ -486,4 +622,8 @@ def run_experiment(
 # ─────────── Точка входа ───────────
 if __name__ == "__main__":
     # Вызов с параметрами по умолчанию
-    results = run_experiment(patch_name='dpatch5000')
+    results = run_experiment(patch_name='patch_example',
+                             image_dir='inria_test',
+                             out_of_box=True,
+                             patch_size=1,
+                             model_path='yolo11s.pt',)
