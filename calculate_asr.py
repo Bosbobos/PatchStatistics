@@ -3,6 +3,7 @@ import math
 import cv2
 import numpy as np
 import onnx
+import pandas as pd
 import torch
 import os
 from onnx2torch import convert
@@ -454,7 +455,7 @@ def detect_and_compare(
                 f"result_{os.path.basename(img_name)}"
             )
             cv2.imwrite(result_path, result_img)
-            print(f"Result saved: {result_path}")
+#            print(f"Result saved: {result_path}")
 
     return num_targets, num_success_real, num_success_black, confidence_drops_real, confidence_drops_black, result_img
 
@@ -551,13 +552,13 @@ def run_experiment(
         successful_attacks_black += num_success_black
         confidence_drops_real.extend(img_drops_real)
         confidence_drops_black.extend(img_drops_black)
-
+        '''
         if num_targets > 0:
             print(f"Processed {os.path.basename(image_file)}: "
                   f"targets={num_targets}, "
                   f"real_success={num_success_real} ({num_success_real / num_targets * 100:.1f}%), "
                   f"black_success={num_success_black} ({num_success_black / num_targets * 100:.1f}%)")
-
+        '''
     # Расчет итоговых метрик
     metrics = {
         'model_path': model_path,
@@ -575,12 +576,14 @@ def run_experiment(
         metrics['mean_confidence_drop_real'] = float(np.mean(confidence_drops_real))
         metrics['mean_confidence_drop_black'] = float(np.mean(confidence_drops_black))
         metrics['relative_effectiveness'] = metrics['asr_real'] - metrics['asr_black']
+        metrics['conf_drop'] = metrics['mean_confidence_drop_real'] - metrics['mean_confidence_drop_black']
     else:
         metrics['asr_real'] = 0.0
         metrics['asr_black'] = 0.0
         metrics['mean_confidence_drop_real'] = 0.0
         metrics['mean_confidence_drop_black'] = 0.0
         metrics['relative_effectiveness'] = 0.0
+        metrics['conf_drop'] = 0.0
 
     # Сохранение результатов в файл
     json_results_path = 'results'
@@ -605,6 +608,7 @@ def run_experiment(
             f"Relative effectiveness: {metrics['relative_effectiveness']:.4f} ({metrics['relative_effectiveness'] * 100:.1f}%)")
         print(f"\nMean confidence drop (real patch): {metrics['mean_confidence_drop_real']:.4f}")
         print(f"Mean confidence drop (black patch): {metrics['mean_confidence_drop_black']:.4f}")
+        print(f"Relative conf drop: {(metrics['conf_drop']):.4f}")
 
         # Дополнительная статистика
         if confidence_drops_real:
@@ -622,8 +626,61 @@ def run_experiment(
 # ─────────── Точка входа ───────────
 if __name__ == "__main__":
     # Вызов с параметрами по умолчанию
-    results = run_experiment(patch_name='patch_example',
+    name = '0709_yolo_dpatch_1000'
+    out_of_box = True
+
+    patch_size = 1 if out_of_box else 0.447
+
+    res_yolo_oob = run_experiment(patch_name=name,
                              image_dir='inria_test',
-                             out_of_box=True,
-                             patch_size=1,
-                             model_path='yolo11s.pt',)
+                             out_of_box=out_of_box,
+                             patch_size=patch_size,
+                             model_path='yolo11s.pt',
+                   save_images=False)
+    '''
+    res_ndet_oob = run_experiment(patch_name=name,
+                             image_dir='test_dataset',
+                             out_of_box=out_of_box,
+                             patch_size=patch_size,
+                             model_path='nanodet.onnx',
+                   save_images=False)
+    '''
+    res_yolo_ib = run_experiment(patch_name=name,
+                             image_dir='inria_test',
+                             out_of_box=False,
+                             patch_size=0.447,
+                             model_path='yolo11s.pt',
+                   save_images=True)
+    '''
+    res_ndet_ib = run_experiment(patch_name=name,
+                             image_dir='test_dataset',
+                             out_of_box=False,
+                             patch_size=0.447,
+                             model_path='nanodet.onnx',
+                   save_images=False)
+
+    '''
+    '''
+    # both
+    comp = {
+        'attack_type': ['ib', 'ib','oob', 'oob'],
+        'model': ['yolo', 'ndet', 'yolo', 'ndet'],
+        'conf_drop': [res_yolo_ib['conf_drop'], res_ndet_ib['conf_drop'], res_yolo_oob['conf_drop'], res_ndet_oob['conf_drop']],
+        'asr': [res_yolo_ib['relative_effectiveness'], res_ndet_ib['relative_effectiveness'], res_yolo_oob['relative_effectiveness'], res_ndet_oob['relative_effectiveness']],
+            }
+    '''
+    '''
+    # nanodet
+    comp = {
+        'attack_type': ['ib','oob'],
+        'conf_drop': [res_ndet_ib['conf_drop'], res_ndet_oob['conf_drop']],
+        'asr': [res_ndet_ib['relative_effectiveness'], res_ndet_oob['relative_effectiveness']],
+            }
+    '''
+    # yolo
+    comp = {
+        'attack_type': ['ib','oob'],
+        'conf_drop': [res_yolo_ib['conf_drop'], res_yolo_oob['conf_drop']],
+        'asr': [res_yolo_ib['relative_effectiveness'], res_yolo_oob['relative_effectiveness']],
+            }
+    print(pd.DataFrame(comp))
