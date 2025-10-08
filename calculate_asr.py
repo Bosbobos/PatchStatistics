@@ -436,7 +436,7 @@ def detect_and_compare(
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
-    if save_images or save_dir:
+    if save_images:
         # Визуализация результатов
         vis_clean = draw(orig_img.copy(), boxes, scores, class_ids, class_names)
         vis_patched = draw(patched_img.copy(), boxes_p, scores_p, class_ids_p, class_names)
@@ -449,12 +449,11 @@ def detect_and_compare(
 
         result_img = np.hstack([vis_clean, vis_patched, vis_black_patched])
 
-        if save_images and save_dir:
-            result_path = os.path.join(
-                save_dir,
-                f"result_{os.path.basename(img_name)}"
-            )
-            cv2.imwrite(result_path, result_img)
+        result_path = os.path.join(
+            save_dir,
+            f"result_{os.path.basename(img_name)}"
+        )
+        cv2.imwrite(result_path, result_img)
 #            print(f"Result saved: {result_path}")
 
     return num_targets, num_success_real, num_success_black, confidence_drops_real, confidence_drops_black, result_img
@@ -563,6 +562,8 @@ def run_experiment(
     metrics = {
         'model_path': model_path,
         'patch_name': patch_name,
+        'dataset': image_dir,
+        'type': 'oob' if out_of_box else 'in box',
         'total_targets': total_targets,
         'successful_attacks_real': successful_attacks_real,
         'successful_attacks_black': successful_attacks_black,
@@ -588,99 +589,173 @@ def run_experiment(
     # Сохранение результатов в файл
     json_results_path = 'results'
     os.makedirs(json_results_path, exist_ok=True)
-    results_file = os.path.join(json_results_path, f"{model_path.split('.')[0]}_{patch_name}.json")
+
+    results_file = os.path.join(json_results_path, f"{model_path.split('.')[0]}_{patch_name}_{os.path.basename(image_dir)}_{metrics['type']}.json")
     with open(results_file, 'w') as f:
         json.dump(metrics, f, indent=2)
-
-    # Вывод результатов
-    print(f"\n{'=' * 60}")
-    print(f"EXPERIMENT RESULTS: {patch_name}")
-    print(f"{'=' * 60}")
-    print(f"Target class: {target_class} ({metrics['target_class_name']})")
-    print(f"Total targets: {total_targets}")
-    print(f"Successful attacks (real patch): {successful_attacks_real}")
-    print(f"Successful attacks (black patch): {successful_attacks_black}")
-
-    if total_targets > 0:
-        print(f"\nASR (real patch): {metrics['asr_real']:.4f} ({metrics['asr_real'] * 100:.1f}%)")
-        print(f"ASR (black patch): {metrics['asr_black']:.4f} ({metrics['asr_black'] * 100:.1f}%)")
-        print(
-            f"Relative effectiveness: {metrics['relative_effectiveness']:.4f} ({metrics['relative_effectiveness'] * 100:.1f}%)")
-        print(f"\nMean confidence drop (real patch): {metrics['mean_confidence_drop_real']:.4f}")
-        print(f"Mean confidence drop (black patch): {metrics['mean_confidence_drop_black']:.4f}")
-        print(f"Relative conf drop: {(metrics['conf_drop']):.4f}")
-
-        # Дополнительная статистика
-        if confidence_drops_real:
-            print(f"Max confidence drop (real): {np.max(confidence_drops_real):.4f}")
-            print(f"Min confidence drop (real): {np.min(confidence_drops_real):.4f}")
-    else:
-        print("No target objects found")
-
-    print(f"\nResults saved to: {results_file}")
-    print(f"{'=' * 60}")
 
     return metrics
 
 
 # ─────────── Точка входа ───────────
 if __name__ == "__main__":
-    # Вызов с параметрами по умолчанию
-    name = '0709_yolo_dpatch_1000'
-    out_of_box = True
+    print('asr_black', 'asr_real', 'mean_confidence_drop_black', 'mean_confidence_drop_real')
 
-    patch_size = 1 if out_of_box else 0.447
+    print('in box')
+    print('1')
+    atk = run_experiment('nanodet.onnx',
+                           'test_dataset',
+                           300,
+                           save_images=False,
+                           out_of_box=False,
+                           patch_size=0.447,
+                           patch_name='NEWdpatch5000')
 
-    res_yolo_oob = run_experiment(patch_name=name,
-                             image_dir='inria_test',
-                             out_of_box=out_of_box,
-                             patch_size=patch_size,
-                             model_path='yolo11s.pt',
-                   save_images=False)
-    '''
-    res_ndet_oob = run_experiment(patch_name=name,
-                             image_dir='test_dataset',
-                             out_of_box=out_of_box,
-                             patch_size=patch_size,
-                             model_path='nanodet.onnx',
-                   save_images=False)
-    '''
-    res_yolo_ib = run_experiment(patch_name=name,
-                             image_dir='inria_test',
-                             out_of_box=False,
-                             patch_size=0.447,
-                             model_path='yolo11s.pt',
-                   save_images=True)
-    '''
-    res_ndet_ib = run_experiment(patch_name=name,
-                             image_dir='test_dataset',
-                             out_of_box=False,
-                             patch_size=0.447,
-                             model_path='nanodet.onnx',
-                   save_images=False)
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
 
-    '''
-    '''
-    # both
-    comp = {
-        'attack_type': ['ib', 'ib','oob', 'oob'],
-        'model': ['yolo', 'ndet', 'yolo', 'ndet'],
-        'conf_drop': [res_yolo_ib['conf_drop'], res_ndet_ib['conf_drop'], res_yolo_oob['conf_drop'], res_ndet_oob['conf_drop']],
-        'asr': [res_yolo_ib['relative_effectiveness'], res_ndet_ib['relative_effectiveness'], res_yolo_oob['relative_effectiveness'], res_ndet_oob['relative_effectiveness']],
-            }
-    '''
-    '''
-    # nanodet
-    comp = {
-        'attack_type': ['ib','oob'],
-        'conf_drop': [res_ndet_ib['conf_drop'], res_ndet_oob['conf_drop']],
-        'asr': [res_ndet_ib['relative_effectiveness'], res_ndet_oob['relative_effectiveness']],
-            }
-    '''
-    # yolo
-    comp = {
-        'attack_type': ['ib','oob'],
-        'conf_drop': [res_yolo_ib['conf_drop'], res_yolo_oob['conf_drop']],
-        'asr': [res_yolo_ib['relative_effectiveness'], res_yolo_oob['relative_effectiveness']],
-            }
-    print(pd.DataFrame(comp))
+
+    print('2')
+    atk = run_experiment('nanodet.onnx',
+                           'test_dataset',
+                           300,
+                           save_images=False,
+                           out_of_box=False,
+                           patch_size=0.447,
+                           patch_name='dpatch5000new')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+    print('3')
+    atk = run_experiment('nanodet.onnx',
+                           'test_dataset',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='nap1500new')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+    print('4')
+    atk = run_experiment('yolo11s.pt',
+                           'inria_test',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='nap1500new')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+    print('4.5')
+    atk = run_experiment('yolo11s.pt',
+                           'inria_test',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='nap_yolo11s')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+
+    print('5')
+    atk = run_experiment('yolo11s.pt',
+                           'inria_test',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='0609_yolo_dpatch_1000')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+
+
+    print('6')
+    atk = run_experiment('nanodet.onnx',
+                           'test_dataset',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='0609_yolo_dpatch_1000')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+
+
+    print('7')
+    atk = run_experiment('yolo11s.pt',
+                           'inria_test',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='0709_yolo_dpatch_1000')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+
+    print('8')
+    atk = run_experiment('nanodet.onnx',
+                           'test_dataset',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='0709_yolo_dpatch_1000')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
+
+
+    print('9')
+    atk = run_experiment('nanodet.onnx',
+                           'test_dataset',
+                           300,
+                           save_images=False,
+                           out_of_box=True,
+                           patch_size=1,
+                           patch_name='1409_gun_yolo_dpatch_1000')
+
+    print(round(atk['asr_black'],4),
+          round(atk['asr_real'], 4),
+          round(atk['mean_confidence_drop_black'], 4),
+          round(atk['mean_confidence_drop_real'], 4),
+          sep=' | ')
