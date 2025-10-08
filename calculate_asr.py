@@ -438,7 +438,10 @@ def detect_and_compare(
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
-    if save_images or save_dir:
+    if save_images:
+        # Создание директории для результатов
+        os.makedirs(save_dir, exist_ok=True)
+
         # Визуализация результатов
         vis_clean = draw(orig_img.copy(), boxes, scores, class_ids, class_names)
         vis_patched = draw(patched_img.copy(), boxes_p, scores_p, class_ids_p, class_names)
@@ -495,9 +498,6 @@ def run_experiment(
     class_names = load_class_names(classes_path)
     if not class_names:
         class_names = [f"class_{i}" for i in range(num_classes)]
-
-    # Создание директории для результатов
-    os.makedirs(results_dir, exist_ok=True)
 
     # Параметры для модели
     model_params = {
