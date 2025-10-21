@@ -1,5 +1,7 @@
 import json
 import math
+from datetime import datetime
+
 import cv2
 import numpy as np
 import onnx
@@ -463,6 +465,176 @@ def detect_and_compare(
     return num_targets, num_success_real, num_success_black, confidence_drops_real, confidence_drops_black, result_img
 
 
+def save_results_to_html(metrics, html_file_path='results.html'):
+    """
+    Сохраняет метрики в HTML-файл с форматированием
+    """
+    # Создаем HTML-структуру
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Результаты атаки</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                margin: 20px;
+                background-color: #f5f5f5;
+            }}
+            .container {{
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 10px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }}
+            .header {{
+                text-align: center;
+                color: #333;
+                border-bottom: 2px solid #eee;
+                padding-bottom: 15px;
+                margin-bottom: 20px;
+            }}
+            .metrics-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }}
+            .metric-card {{
+                background: #f8f9fa;
+                padding: 15px;
+                border-radius: 8px;
+                border-left: 4px solid #007bff;
+            }}
+            .metric-value {{
+                font-size: 1.4em;
+                font-weight: bold;
+                color: #007bff;
+            }}
+            .metric-label {{
+                font-size: 0.9em;
+                color: #666;
+                margin-bottom: 5px;
+            }}
+            .success-rate {{
+                background: #d4edda;
+                border-left-color: #28a745;
+            }}
+            .confidence-drop {{
+                background: #fff3cd;
+                border-left-color: #ffc107;
+            }}
+            .timestamp {{
+                text-align: right;
+                color: #888;
+                font-size: 0.8em;
+                margin-top: 20px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+            }}
+            th, td {{
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }}
+            th {{
+                background-color: #f8f9fa;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>📊 Результаты атаки на модель</h1>
+                <p>Анализ эффективности adversarial patch</p>
+            </div>
+
+            <div class="metrics-grid">
+                <div class="metric-card success-rate">
+                    <div class="metric-label">ASR (Real)</div>
+                    <div class="metric-value">{metrics.get('asr_real', 0.0) * 100:.2f}%</div>
+                </div>
+                <div class="metric-card success-rate">
+                    <div class="metric-label">ASR (Black)</div>
+                    <div class="metric-value">{metrics.get('asr_black', 0.0) * 100:.2f}%</div>
+                </div>
+                <div class="metric-card confidence-drop">
+                    <div class="metric-label">Снижение уверенности (Real)</div>
+                    <div class="metric-value">{metrics.get('mean_confidence_drop_real', 0.0):.4f}</div>
+                </div>
+                <div class="metric-card confidence-drop">
+                    <div class="metric-label">Снижение уверенности (Black)</div>
+                    <div class="metric-value">{metrics.get('mean_confidence_drop_black', 0.0):.4f}</div>
+                </div>
+            </div>
+
+            <h2>Детальная информация</h2>
+            <table>
+                <tr>
+                    <th>Параметр</th>
+                    <th>Значение</th>
+                </tr>
+                <tr>
+                    <td>Модель</td>
+                    <td>{metrics.get('model_path', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td>Patch</td>
+                    <td>{metrics.get('patch_name', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td>Датасет</td>
+                    <td>{metrics.get('dataset', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td>Тип атаки</td>
+                    <td>{metrics.get('type', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td>Целевой класс</td>
+                    <td>{metrics.get('target_class', 'N/A')} - {metrics.get('target_class_name', 'N/A')}</td>
+                </tr>
+                <tr>
+                    <td>Всего целей</td>
+                    <td>{metrics.get('total_targets', 0)}</td>
+                </tr>
+                <tr>
+                    <td>Успешные атаки (Real)</td>
+                    <td>{metrics.get('successful_attacks_real', 0)}</td>
+                </tr>
+                <tr>
+                    <td>Успешные атаки (Black)</td>
+                    <td>{metrics.get('successful_attacks_black', 0)}</td>
+                </tr>
+                <tr>
+                    <td>Относительная эффективность</td>
+                    <td>{metrics.get('relative_effectiveness', 0.0):.4f}</td>
+                </tr>
+                <tr>
+                    <td>Разница в снижении уверенности</td>
+                    <td>{metrics.get('conf_drop', 0.0):.4f}</td>
+                </tr>
+            </table>
+
+            <div class="timestamp">
+                Сгенерировано: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    # Сохраняем HTML-файл
+    with open(html_file_path, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+
 # ─────────── Основная логика ───────────
 def run_experiment(
         model_path: str = "nanodet.onnx",
@@ -594,6 +766,15 @@ def run_experiment(
     results_file = os.path.join(json_results_path, f"{model_path.split('.')[0]}_{patch_name}_{os.path.basename(image_dir)}_{metrics['type']}.json")
     with open(results_file, 'w') as f:
         json.dump(metrics, f, indent=2)
+
+    results_path = 'results'
+    os.makedirs(results_path, exist_ok=True)
+
+        # Сохраняем в HTML
+    html_filename = f"{model_path.split('.')[0]}_{patch_name}_{os.path.basename(image_dir)}_{'oob' if out_of_box else 'in_box'}.html"
+    html_file_path = os.path.join(results_path, html_filename)
+
+    save_results_to_html(metrics, html_file_path)
 
     return metrics
 
