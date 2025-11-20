@@ -180,7 +180,6 @@ def apply_patch(
         patched[:patch_width, :patch_height] = patch_resized
         return patched
 
-
     target_indices = np.where(class_ids == target_class)[0]
 
     for i in target_indices:
@@ -249,49 +248,66 @@ def apply_patch(
 
 
 def load_model(
-        model_path: str
+        model_path: str,
+        model_backend: str = 'ultralytics'  # 'ultralytics' или 'yolov5_hub'
 ) -> Tuple[Any, int, int, int]:
     """
-    Загружает модель YOLO или ONNX в зависимости от расширения файла
+    Загружает модель YOLO или ONNX в зависимости от расширения файла и бэкенда
     """
     device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
-    if model_path.endswith('.pt'):  # YOLO модель
-        # Для YOLO моделей возвращаем специальный кортеж
-        model = YOLO(model_path).to(device)
-        # Получаем информацию о входных размерах из модели
-        input_shape = model.model.args.get('imgsz', 640)  # стандартный размер для YOLOv8
-        if isinstance(input_shape, (list, tuple)):
-            H, W = input_shape
+
+    if model_path.endswith('.pt'):
+        if model_backend == 'ultralytics':
+            # Загрузка через пакет 'ultralytics' (API YOLOv8)
+            model = YOLO(model_path).to(device)
+            input_shape = model.model.args.get('imgsz', 640)
+            if isinstance(input_shape, (list, tuple)):
+                H, W = input_shape
+            else:
+                H = W = input_shape
+            num_classes = model.model.nc
+            # Возвращаем кортеж с (model, 'yolo', 'backend_type')
+            return (model, 'yolo', 'yolo_ultralytics'), H, W, num_classes
+
+        elif model_backend == 'yolov5_hub':
+            # Загрузка через torch.hub (оригинальная библиотека yolov5)
+            # 'trust_repo=True' может понадобиться для последних версий torch
+            model = torch.hub.load("ultralytics/yolov5", "yolov5s").to(device)
+            H = W = model.imgsz if hasattr(model, 'imgsz') else 640
+            num_classes = model.model.model.nc
+            # Возвращаем кортеж с (model, 'yolo', 'backend_type')
+            return (model, 'yolo', 'yolo_hub'), H, W, num_classes
+        elif model_backend == 'yolov3_hub':
+            # Загрузка через torch.hub (оригинальная библиотека yolov5)
+            # 'trust_repo=True' может понадобиться для последних версий torch
+            model = torch.hub.load("ultralytics/yolov5", "yolov5s").to(device)
+            H = W = model.imgsz if hasattr(model, 'imgsz') else 640
+            num_classes = model.model.model.nc
+            # Возвращаем кортеж с (model, 'yolo', 'backend_type')
+            return (model, 'yolo', 'yolo_hub'), H, W, num_classes
         else:
-            H = W = input_shape
+            raise ValueError(f"Unknown model_backend for .pt file: {model_backend}")
 
-        # Получаем количество классов
-        num_classes = model.model.nc
-
-        return (model, 'yolo'), H, W, num_classes
-
-    else:  # ONNX модель (оригинальная логика)
+    elif model_path.endswith('.onnx'):  # ONNX модель (оригинальная логика)
         onnx_model = onnx.load(model_path)
-
-        # Получаем размеры входа
         input_shape = onnx_model.graph.input[0].type.tensor_type.shape
         H = input_shape.dim[2].dim_value
         W = input_shape.dim[3].dim_value
-
-        # Получаем размерность выхода
         output_shape = onnx_model.graph.output[0].type.tensor_type.shape
         D = output_shape.dim[2].dim_value
-        num_classes = D - 32  # 32 - количество смещений (offsets)
-
+        num_classes = D - 32
         model = convert(onnx_model).to(device=device)
         model = model
+        # ONNX возвращает модель напрямую (не в кортеже)
         return model, H, W, num_classes
+    else:
+        raise ValueError("Unsupported model format. Use .pt or .onnx")
 
 
 def yolo_detect(model, img: np.ndarray, conf_threshold: float = 0.3) -> Tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Детекция с использованием YOLO модели
+    Детекция с использованием YOLO модели (пакет 'ultralytics')
     """
     results = model(img, conf=conf_threshold, verbose=False)
 
@@ -310,6 +326,37 @@ def yolo_detect(model, img: np.ndarray, conf_threshold: float = 0.3) -> Tuple[
             scores_all[i, class_id] = scores[i]
     else:
         scores_all = np.array([])
+
+    return boxes, scores, class_ids, scores_all
+
+
+def yolo_hub_detect(
+        model, img: np.ndarray, conf_threshold: float, num_classes: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Детекция с использованием ОРИГИНАЛЬНОЙ YOLOv5 (torch.hub)
+    """
+    results = model(img)  # Модель сама применяет нужный размер
+
+    # results.xyxy[0] это тензор [x1, y1, x2, y2, conf, cls]
+    preds = results.xyxy[0].cpu().numpy()
+
+    # Фильтруем по conf_threshold
+    preds = preds[preds[:, 4] >= conf_threshold]
+
+    if preds.shape[0] == 0:
+        return np.zeros((0, 4)), np.array([]), np.array([]), np.zeros((0, num_classes))
+
+    boxes = preds[:, :4]
+    scores = preds[:, 4]
+    class_ids = preds[:, 5].astype(int)
+
+    # Для совместимости с интерфейсом создаем scores_all
+    scores_all = np.zeros((len(class_ids), num_classes))
+    if len(class_ids) > 0:
+        for i, class_id in enumerate(class_ids):
+            if class_id < num_classes:
+                scores_all[i, class_id] = scores[i]
 
     return boxes, scores, class_ids, scores_all
 
@@ -344,12 +391,18 @@ def detect_and_compare(
     class_names = model_params['class_names']
     model_type = model_params.get('model_type', 'onnx')  # 'onnx' или 'yolo'
 
+    # Определяем бэкенд YOLO (по умолчанию 'ultralytics' для обратной совместимости)
+    model_backend_type = model_params.get('model_backend_type', 'yolo_ultralytics')
+
     orig_h, orig_w = img.shape[:2]
 
     # Детекция на исходном изображении
     if model_type == 'yolo':
-        boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold)
-    else:
+        if model_backend_type == 'yolo_ultralytics':
+            boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold)
+        elif model_backend_type == 'yolo_hub':
+            boxes, scores, class_ids, scores_all = yolo_hub_detect(model, img, conf_threshold, num_classes)
+    else:  # onnx
         blob = preprocess(img, (H, W), mean, scale)
         pred = model(torch.from_numpy(blob))[0].detach().numpy()
         boxes, scores, class_ids, scores_all = postprocess(
@@ -369,9 +422,16 @@ def detect_and_compare(
 
     # Детекция на изображении с настоящим патчем
     if model_type == 'yolo':
-        boxes_p, scores_p, class_ids_p, scores_all_p = yolo_detect(model, patched_img, conf_threshold)
-        boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_detect(model, black_patched_img, conf_threshold)
-    else:
+        if model_backend_type == 'yolo_ultralytics':
+            boxes_p, scores_p, class_ids_p, scores_all_p = yolo_detect(model, patched_img, conf_threshold)
+            boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_detect(model, black_patched_img, conf_threshold)
+        elif model_backend_type == 'yolo_hub':
+            boxes_p, scores_p, class_ids_p, scores_all_p = yolo_hub_detect(model, patched_img, conf_threshold,
+                                                                           num_classes)
+            boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_hub_detect(model, black_patched_img, conf_threshold,
+                                                                               num_classes)
+
+    else:  # onnx
         blob = preprocess(patched_img, (H, W), mean, scale)
         pred = model(torch.from_numpy(blob))[0].detach().numpy()
         boxes_p, scores_p, class_ids_p, scores_all_p = postprocess(
@@ -396,7 +456,7 @@ def detect_and_compare(
 
     for idx in target_indices:
         orig_box = boxes[idx]
-        orig_score = scores_all[idx, target_class] if scores_all.size > 0 else 0
+        orig_score = scores_all[idx, target_class] if scores_all.size > 0 and idx < len(scores_all) else 0
 
         # Проверяем эффективность настоящего патча
         found_real = False
@@ -405,7 +465,8 @@ def detect_and_compare(
                 iou = calculate_iou(orig_box, patched_box)
                 if iou > 0.5:
                     found_real = True
-                    patched_score = scores_all_p[j, target_class] if scores_all_p.size > 0 else 0
+                    patched_score = scores_all_p[j, target_class] if scores_all_p.size > 0 and j < len(
+                        scores_all_p) else 0
                     confidence_drop = orig_score - patched_score
                     confidence_drops_real.append(confidence_drop)
 
@@ -415,7 +476,8 @@ def detect_and_compare(
 
         if not found_real:
             confidence_drops_real.append(orig_score)
-            num_success_real += 1
+            if orig_score > threshold:
+                num_success_real += 1
 
         # Проверяем эффективность черного патча
         found_black = False
@@ -424,7 +486,8 @@ def detect_and_compare(
                 iou = calculate_iou(orig_box, black_patched_box)
                 if iou > 0.5:
                     found_black = True
-                    black_patched_score = scores_all_bp[j, target_class] if scores_all_bp.size > 0 else 0
+                    black_patched_score = scores_all_bp[j, target_class] if scores_all_bp.size > 0 and j < len(
+                        scores_all_bp) else 0
                     confidence_drop = orig_score - black_patched_score
                     confidence_drops_black.append(confidence_drop)
 
@@ -434,7 +497,8 @@ def detect_and_compare(
 
         if not found_black:
             confidence_drops_black.append(orig_score)
-            num_success_black += 1
+            if orig_score > threshold:
+                num_success_black += 1
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
@@ -477,6 +541,7 @@ def run_experiment(
         save_images: bool = True,
         out_of_box: bool = False,
         near_box: bool = False,
+        model_backend: str = 'ultralytics'  # 'ultralytics' или 'yolov5_hub'
 ) -> Dict[str, Any]:
     # Вычисляем производные пути
     patch_path = f"{patch_name}.png"
@@ -484,13 +549,15 @@ def run_experiment(
         results_dir = f"patched_{patch_name}" + ('_oob' if out_of_box else "") + ('_near_box' if near_box else '')
 
     # Загрузка модели
-    model_info, H, W, num_classes = load_model(model_path)
+    model_info, H, W, num_classes = load_model(model_path, model_backend=model_backend)
 
     # Определяем тип модели
-    if isinstance(model_info, tuple) and model_info[1] == 'yolo':
-        model, model_type = model_info
-        model_type_str = 'yolo'
+    model_backend_type = 'onnx'  # По умолчанию
+    if isinstance(model_info, tuple):
+        # (model, 'yolo', 'yolo_ultralytics'/'yolo_hub')
+        model, model_type_str, model_backend_type = model_info
     else:
+        # model (для ONNX)
         model = model_info
         model_type_str = 'onnx'
 
@@ -509,7 +576,8 @@ def run_experiment(
         'conf_threshold': conf_threshold,
         'num_classes': num_classes,
         'class_names': class_names,
-        'model_type': model_type_str  # Добавляем тип модели
+        'model_type': model_type_str,  # 'yolo' или 'onnx'
+        'model_backend_type': model_backend_type  # 'yolo_ultralytics', 'yolo_hub' или 'onnx'
     }
 
     # Статистика для обоих типов патчей
@@ -562,6 +630,7 @@ def run_experiment(
     # Расчет итоговых метрик
     metrics = {
         'model_path': model_path,
+        'model_backend': model_backend,
         'patch_name': patch_name,
         'dataset': image_dir,
         'type': 'oob' if out_of_box else 'in box',
@@ -575,8 +644,9 @@ def run_experiment(
     if total_targets > 0:
         metrics['asr_real'] = successful_attacks_real / total_targets
         metrics['asr_black'] = successful_attacks_black / total_targets
-        metrics['mean_confidence_drop_real'] = float(np.mean(confidence_drops_real))
-        metrics['mean_confidence_drop_black'] = float(np.mean(confidence_drops_black))
+        metrics['mean_confidence_drop_real'] = float(np.mean(confidence_drops_real)) if confidence_drops_real else 0.0
+        metrics['mean_confidence_drop_black'] = float(
+            np.mean(confidence_drops_black)) if confidence_drops_black else 0.0
         metrics['relative_effectiveness'] = metrics['asr_real'] - metrics['asr_black']
         metrics['conf_drop'] = metrics['mean_confidence_drop_real'] - metrics['mean_confidence_drop_black']
     else:
@@ -591,17 +661,28 @@ def run_experiment(
     json_results_path = 'results'
     os.makedirs(json_results_path, exist_ok=True)
 
-    results_file = os.path.join(json_results_path, f"{model_path.split('.')[0]}_{patch_name}_{os.path.basename(image_dir)}_{metrics['type']}.json")
+    results_file = os.path.join(json_results_path,
+                                f"{model_path.split('.')[0]}_{model_backend}_{patch_name}_{os.path.basename(image_dir)}_{metrics['type']}.json")
     with open(results_file, 'w') as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
 
     return metrics
 
 
 # ─────────── Точка входа ───────────
 if __name__ == "__main__":
-    metrics = run_experiment('yolo11s.pt',
-                   'dataset',
-                   patch_name='patch_example',
-                   save_images=False,)
+    # Теперь можно выбрать бэкенд для загрузки .pt файла:
+    # 'ultralytics' -> использует `from ultralytics import YOLO` (API v8)
+    # 'yolov5_hub'  -> использует `torch.hub.load('ultralytics/yolov5', ...)` (API v5)
+    import warnings
+    warnings.filterwarnings('ignore')
+
+    metrics = run_experiment('yolov5s.pt',
+                             'inria_test',
+                             model_backend='yolov5_hub',  # Указываем, что хотим использовать оригинальный yolov5
+                             patch_name='yolo5s_dpatch_1000_1911_0-255_no_autocast_lr_5e-2',
+                             save_images=True,
+                             out_of_box=True,
+                             patch_size=1,
+                             )
     [print(f"{key}: {value}") for key, value in metrics.items()]

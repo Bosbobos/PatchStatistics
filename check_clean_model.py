@@ -186,8 +186,8 @@ def evaluate_model_metrics(
 
 if __name__ == '__main__':
     yolo_results = evaluate_model_metrics(
-        model_path='yolo11s.pt',
-        data_dir='dataset',
+        model_path='yolov5s.pt',
+        data_dir='inria_test',
         conf_threshold=0.3,
         target_class=0
     )
