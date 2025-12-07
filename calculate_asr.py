@@ -156,6 +156,7 @@ def apply_patch(
         patch_size: float,
         out_of_box: bool = False,
         near_box: bool = False,
+        location=(0,0)
 ) -> np.ndarray:
     """
     Применяет патч к объектам целевого класса на изображении
@@ -178,7 +179,12 @@ def apply_patch(
         patch_width = max(5, int(patch.shape[0] * patch_size))
         patch_height = max(5, int(patch.shape[1] * patch_size))
         patch_resized = cv2.resize(patch, (patch_width, patch_height))
-        patched[:patch_width, :patch_height] = patch_resized
+        w, h = location
+        if h == -1:
+            h = img.shape[0] - patch_height
+        if w == -1:
+            w = img.shape[1] - patch_width
+        patched[h:h+patch_height, w:w+patch_width] = patch_resized
         return patched
 
     target_indices = np.where(class_ids == target_class)[0]
@@ -293,7 +299,7 @@ def load_model(
             if module_def["type"] == "yolo":
                 num_classes = int(module_def["classes"])
                 break
-        return (model, 'yolo', 'yolo_pytorchyolo'), H, W, num_classes
+            return (model, 'yolo', 'yolo_pytorchyolo'), H, W, num_classes
 
     elif model_path.endswith('.onnx'):  # ONNX модель (оригинальная логика)
         onnx_model = onnx.load(model_path)
@@ -411,6 +417,7 @@ def detect_and_compare(
         img_name: Optional[str] = None,
         out_of_box: bool = False,
         near_box: bool = False,
+        location=(0, 0)
 ) -> Tuple[int, int, int, List[float], List[float], Optional[np.ndarray]]:
     """
     Обрабатывает изображение: детектирует объекты, применяет патч и черный квадрат,
@@ -449,13 +456,13 @@ def detect_and_compare(
 
     # Применяем настоящий патч к целевым объектам
     patched_img = apply_patch(
-        img, boxes, class_ids, target_class, patch_path, patch_size, out_of_box, near_box
+        img, boxes, class_ids, target_class, patch_path, patch_size, out_of_box, near_box, location
     )
 
     # Применяем черный патч к целевым объектам
     black_patch_path = 'black_patch.png'
     black_patched_img = apply_patch(
-        img, boxes, class_ids, target_class, black_patch_path, patch_size, out_of_box, near_box
+        img, boxes, class_ids, target_class, black_patch_path, patch_size, out_of_box, near_box, location
     )
 
     # Детекция на изображении с настоящим патчем
@@ -584,7 +591,8 @@ def run_experiment(
         save_images: bool = True,
         out_of_box: bool = False,
         near_box: bool = False,
-        model_backend: str = 'ultralytics'  # 'ultralytics', 'yolov5_hub' или 'pytorchyolo'
+        model_backend: str = 'ultralytics',  # 'ultralytics', 'yolov5_hub' или 'pytorchyolo',
+        location=(0,0)
 ) -> Dict[str, Any]:
     # Вычисляем производные пути
     patch_path = f"{patch_name}.png"
@@ -655,6 +663,7 @@ def run_experiment(
             img_name=os.path.basename(image_file),
             out_of_box=out_of_box,
             near_box=near_box,
+            location=location
         )
 
         # Обновляем статистику
@@ -725,8 +734,9 @@ if __name__ == "__main__":
                              'inria_test',
                              model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
                              patch_name='0709_yolo_dpatch_1000',
-                             save_images=False,
+                             save_images=True,
                              out_of_box=True,
                              patch_size=1,
+                             location=(-1,-1)
                              )
     [print(f"{key}: {value}") for key, value in metrics.items()]
