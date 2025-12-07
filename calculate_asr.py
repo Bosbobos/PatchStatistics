@@ -11,6 +11,7 @@ from typing import Optional, List, Tuple, Dict, Any
 
 from tqdm import tqdm
 from ultralytics import YOLO
+from pytorchyolo import detect, models
 
 
 # ─────────── Вспомогательные функции ───────────
@@ -249,7 +250,7 @@ def apply_patch(
 
 def load_model(
         model_path: str,
-        model_backend: str = 'ultralytics'  # 'ultralytics' или 'yolov5_hub'
+        model_backend: str = 'ultralytics'  # 'ultralytics', 'yolov5_hub', 'pytorchyolo'
 ) -> Tuple[Any, int, int, int]:
     """
     Загружает модель YOLO или ONNX в зависимости от расширения файла и бэкенда
@@ -272,21 +273,27 @@ def load_model(
         elif model_backend == 'yolov5_hub':
             # Загрузка через torch.hub (оригинальная библиотека yolov5)
             # 'trust_repo=True' может понадобиться для последних версий torch
-            model = torch.hub.load("ultralytics/yolov5", "yolov5s").to(device)
+            model = torch.hub.load("ultralytics/yolov5", "custom", path=model_path, force_reload=True).to(device)
             H = W = model.imgsz if hasattr(model, 'imgsz') else 640
-            num_classes = model.model.model.nc
-            # Возвращаем кортеж с (model, 'yolo', 'backend_type')
-            return (model, 'yolo', 'yolo_hub'), H, W, num_classes
-        elif model_backend == 'yolov3_hub':
-            # Загрузка через torch.hub (оригинальная библиотека yolov5)
-            # 'trust_repo=True' может понадобиться для последних версий torch
-            model = torch.hub.load("ultralytics/yolov5", "yolov5s").to(device)
-            H = W = model.imgsz if hasattr(model, 'imgsz') else 640
-            num_classes = model.model.model.nc
+            num_classes = model.model.nc if hasattr(model.model, 'nc') else 80
             # Возвращаем кортеж с (model, 'yolo', 'backend_type')
             return (model, 'yolo', 'yolo_hub'), H, W, num_classes
         else:
             raise ValueError(f"Unknown model_backend for .pt file: {model_backend}")
+
+    elif model_path.endswith('.weights') and model_backend == 'pytorchyolo':
+        # Загрузка через pytorchyolo (для YOLOv3)
+        config_path = model_path.rsplit('.', 1)[0] + '.cfg'
+        model = models.load_model(config_path, model_path)
+        #model.to(device)
+        input_size = int(model.hyperparams['height'])
+        H = W = input_size
+        num_classes = 80  # default
+        for module_def in model.module_defs:
+            if module_def["type"] == "yolo":
+                num_classes = int(module_def["classes"])
+                break
+        return (model, 'yolo', 'yolo_pytorchyolo'), H, W, num_classes
 
     elif model_path.endswith('.onnx'):  # ONNX модель (оригинальная логика)
         onnx_model = onnx.load(model_path)
@@ -301,7 +308,7 @@ def load_model(
         # ONNX возвращает модель напрямую (не в кортеже)
         return model, H, W, num_classes
     else:
-        raise ValueError("Unsupported model format. Use .pt or .onnx")
+        raise ValueError("Unsupported model format or backend. Use .pt, .weights or .onnx with appropriate backend")
 
 
 def yolo_detect(model, img: np.ndarray, conf_threshold: float = 0.3) -> Tuple[
@@ -361,6 +368,35 @@ def yolo_hub_detect(
     return boxes, scores, class_ids, scores_all
 
 
+def yolo_pytorchyolo_detect(
+        model, img: np.ndarray, conf_threshold: float, num_classes: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Детекция с использованием YOLOv3 из pytorchyolo
+    """
+    # Конвертируем в RGB
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Выполняем детекцию
+    detections = detect.detect_image(model, img_rgb, conf_thres=conf_threshold, nms_thres=0.45)
+
+    if detections is None or len(detections) == 0:
+        return np.zeros((0, 4)), np.array([]), np.array([]), np.zeros((0, num_classes))
+
+    detections = np.array(detections)
+    boxes = detections[:, :4]
+    scores = detections[:, 4]
+    class_ids = detections[:, 5].astype(int)
+
+    # Создаем scores_all для совместимости
+    scores_all = np.zeros((len(class_ids), num_classes))
+    for i, cid in enumerate(class_ids):
+        if cid < num_classes:
+            scores_all[i, cid] = scores[i]
+
+    return boxes, scores, class_ids, scores_all
+
+
 def detect_and_compare(
         model: Any,
         img: np.ndarray,
@@ -402,6 +438,8 @@ def detect_and_compare(
             boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold)
         elif model_backend_type == 'yolo_hub':
             boxes, scores, class_ids, scores_all = yolo_hub_detect(model, img, conf_threshold, num_classes)
+        elif model_backend_type == 'yolo_pytorchyolo':
+            boxes, scores, class_ids, scores_all = yolo_pytorchyolo_detect(model, img, conf_threshold, num_classes)
     else:  # onnx
         blob = preprocess(img, (H, W), mean, scale)
         pred = model(torch.from_numpy(blob))[0].detach().numpy()
@@ -430,6 +468,11 @@ def detect_and_compare(
                                                                            num_classes)
             boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_hub_detect(model, black_patched_img, conf_threshold,
                                                                                num_classes)
+        elif model_backend_type == 'yolo_pytorchyolo':
+            boxes_p, scores_p, class_ids_p, scores_all_p = yolo_pytorchyolo_detect(model, patched_img, conf_threshold,
+                                                                                   num_classes)
+            boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_pytorchyolo_detect(model, black_patched_img,
+                                                                                       conf_threshold, num_classes)
 
     else:  # onnx
         blob = preprocess(patched_img, (H, W), mean, scale)
@@ -541,7 +584,7 @@ def run_experiment(
         save_images: bool = True,
         out_of_box: bool = False,
         near_box: bool = False,
-        model_backend: str = 'ultralytics'  # 'ultralytics' или 'yolov5_hub'
+        model_backend: str = 'ultralytics'  # 'ultralytics', 'yolov5_hub' или 'pytorchyolo'
 ) -> Dict[str, Any]:
     # Вычисляем производные пути
     patch_path = f"{patch_name}.png"
@@ -554,7 +597,7 @@ def run_experiment(
     # Определяем тип модели
     model_backend_type = 'onnx'  # По умолчанию
     if isinstance(model_info, tuple):
-        # (model, 'yolo', 'yolo_ultralytics'/'yolo_hub')
+        # (model, 'yolo', 'yolo_ultralytics'/'yolo_hub'/'yolo_pytorchyolo')
         model, model_type_str, model_backend_type = model_info
     else:
         # model (для ONNX)
@@ -577,7 +620,7 @@ def run_experiment(
         'num_classes': num_classes,
         'class_names': class_names,
         'model_type': model_type_str,  # 'yolo' или 'onnx'
-        'model_backend_type': model_backend_type  # 'yolo_ultralytics', 'yolo_hub' или 'onnx'
+        'model_backend_type': model_backend_type  # 'yolo_ultralytics', 'yolo_hub', 'yolo_pytorchyolo' или 'onnx'
     }
 
     # Статистика для обоих типов патчей
@@ -675,13 +718,14 @@ if __name__ == "__main__":
     # 'ultralytics' -> использует `from ultralytics import YOLO` (API v8)
     # 'yolov5_hub'  -> использует `torch.hub.load('ultralytics/yolov5', ...)` (API v5)
     import warnings
+
     warnings.filterwarnings('ignore')
 
-    metrics = run_experiment('yolov5s.pt',
+    metrics = run_experiment('yolo11s.pt',
                              'inria_test',
-                             model_backend='yolov5_hub',  # Указываем, что хотим использовать оригинальный yolov5
-                             patch_name='yolo5s_dpatch_1000_1911_0-255_no_autocast_lr_5e-2',
-                             save_images=True,
+                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
+                             patch_name='0709_yolo_dpatch_1000',
+                             save_images=False,
                              out_of_box=True,
                              patch_size=1,
                              )
