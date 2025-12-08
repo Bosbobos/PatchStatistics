@@ -1,5 +1,8 @@
 import json
 import os
+from typing import Any
+
+from numpy import ndarray, dtype
 from tqdm import tqdm
 
 from Geometry import distance_between_squares
@@ -11,12 +14,12 @@ def apply_patch(
         boxes: np.ndarray,
         class_ids: np.ndarray,
         target_class: int,
-        patch_path: str,
+        patch: np.ndarray,
         patch_size: float,
         out_of_box: bool = False,
         near_box: bool = False,
         location=(0,0)
-) -> np.ndarray:
+) -> tuple[ndarray, list[tuple[int, int] | Any]] | tuple[ndarray, None]:
     """
     Применяет патч к объектам целевого класса на изображении
 
@@ -29,14 +32,10 @@ def apply_patch(
     :return: изображение с наложенными патчами
     """
     patched = img.copy()
-    patch = cv2.imread(patch_path, cv2.IMREAD_UNCHANGED)
-
-    if patch is None:
-        raise FileNotFoundError(f"Patch file not found: {patch_path}")
 
     if out_of_box:
-        patch_width = max(5, int(patch.shape[0] * patch_size))
-        patch_height = max(5, int(patch.shape[1] * patch_size))
+        patch_width = max(5, int(patch.shape[1] * patch_size))
+        patch_height = max(5, int(patch.shape[0] * patch_size))
         patch_resized = cv2.resize(patch, (patch_width, patch_height))
         w, h = location
         if h == -1:
@@ -44,7 +43,7 @@ def apply_patch(
         if w == -1:
             w = img.shape[1] - patch_width
         patched[h:h+patch_height, w:w+patch_width] = patch_resized
-        return patched
+        return patched, [w, h, w+patch_width, h+patch_height]
 
     target_indices = np.where(class_ids == target_class)[0]
 
@@ -110,7 +109,7 @@ def apply_patch(
         except Exception as e:
             print(f"Error applying patch: {e}")
 
-    return patched
+    return patched, None
 
 def detect_and_compare(
         model: Any,
@@ -127,7 +126,8 @@ def detect_and_compare(
         out_of_box: bool = False,
         near_box: bool = False,
         location=(0, 0)
-) -> Tuple[int, int, int, List[float], List[float], Optional[np.ndarray]]:
+) -> tuple[
+    int, int | Any, int | Any, list[Any], list[Any], ndarray[Any, dtype[Any]] | None, list[Any], list[Any], list[Any]]:
     """
     Обрабатывает изображение: детектирует объекты, применяет патч и черный квадрат,
     сравнивает результаты
@@ -163,15 +163,22 @@ def detect_and_compare(
             pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
         )
 
+    patch = cv2.imread(patch_path, cv2.IMREAD_UNCHANGED)
+    if patch is None:
+        raise FileNotFoundError(f"Patch file not found: {patch_path}")
+
     # Применяем настоящий патч к целевым объектам
-    patched_img = apply_patch(
-        img, boxes, class_ids, target_class, patch_path, patch_size, out_of_box, near_box, location
+    patched_img, patch_square = apply_patch(
+        img, boxes, class_ids, target_class, patch, patch_size, out_of_box, near_box, location
     )
 
-    # Применяем черный патч к целевым объектам
     black_patch_path = 'black_patch.png'
-    black_patched_img = apply_patch(
-        img, boxes, class_ids, target_class, black_patch_path, patch_size, out_of_box, near_box, location
+    black_patch = cv2.imread(black_patch_path, cv2.IMREAD_UNCHANGED)
+    if black_patch is None:
+        raise FileNotFoundError(f"Patch file not found: {patch_path}")
+    # Применяем черный патч к целевым объектам
+    black_patched_img, black_patch_square = apply_patch(
+        img, boxes, class_ids, target_class, black_patch, patch_size, out_of_box, near_box, location
     )
 
     # Детекция на изображении с настоящим патчем
@@ -209,6 +216,9 @@ def detect_and_compare(
     num_success_black = 0  # Успехи с черным патчем
     confidence_drops_real = []  # Падение уверенности с настоящим патчем
     confidence_drops_black = []  # Падение уверенности с черным патчем
+    all_distances = [] # Расстояния от патча до объекта (считается между двумя ближайшими точками)
+    successful_real_distances = []
+    successful_black_distances = []
 
     target_indices = np.where(class_ids == target_class)[0]
     num_targets = len(target_indices)
@@ -217,7 +227,14 @@ def detect_and_compare(
         orig_box = boxes[idx]
         orig_score = scores_all[idx, target_class] if scores_all.size > 0 and idx < len(scores_all) else 0
 
+        if patch_square is not None:
+            dist = distance_between_squares(orig_box, patch_square)
+        else:
+            dist = 0
+        all_distances.append(dist)
+
         # Проверяем эффективность настоящего патча
+        success = False
         found_real = False
         for j, patched_box in enumerate(boxes_p):
             if class_ids_p[j] == target_class:
@@ -230,13 +247,25 @@ def detect_and_compare(
                     confidence_drops_real.append(confidence_drop)
 
                     if orig_score > threshold and patched_score < threshold:
+                        success = True
                         num_success_real += 1
+                        if patch_square is not None:
+                            dist = distance_between_squares(orig_box, patch_square)
+                        else:
+                            dist = 0
+                        successful_real_distances.append(dist)
                     break
 
         if not found_real:
             confidence_drops_real.append(orig_score)
             if orig_score > threshold:
+                success = True
                 num_success_real += 1
+                if patch_square is not None:
+                    dist = distance_between_squares(orig_box, patch_square)
+                else:
+                    dist = 0
+                successful_real_distances.append(dist)
 
         # Проверяем эффективность черного патча
         found_black = False
@@ -252,12 +281,22 @@ def detect_and_compare(
 
                     if orig_score > threshold and black_patched_score < threshold:
                         num_success_black += 1
+                        if black_patch_square is not None:
+                            dist = distance_between_squares(orig_box, black_patch_square)
+                        else:
+                            dist = 0
+                        successful_black_distances.append(dist)
                     break
 
         if not found_black:
             confidence_drops_black.append(orig_score)
             if orig_score > threshold:
                 num_success_black += 1
+                if black_patch_square is not None:
+                    dist = distance_between_squares(orig_box, black_patch_square)
+                else:
+                    dist = 0
+                successful_black_distances.append(dist)
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
@@ -283,7 +322,11 @@ def detect_and_compare(
         )
         cv2.imwrite(result_path, result_img)
 
-    return num_targets, num_success_real, num_success_black, confidence_drops_real, confidence_drops_black, result_img
+    return (num_targets,
+            num_success_real, num_success_black,
+            confidence_drops_real, confidence_drops_black,
+            result_img,
+            all_distances, successful_real_distances, successful_black_distances)
 
 def run_experiment(
         model_path: str = "nanodet.onnx",
@@ -344,6 +387,9 @@ def run_experiment(
     successful_attacks_black = 0
     confidence_drops_real = []
     confidence_drops_black = []
+    all_distances = []
+    all_successful_real_distances = []
+    all_successful_black_distances = []
 
     # Обработка изображений
     image_files = [os.path.join(image_dir, f) for f in os.listdir(image_dir)
@@ -357,7 +403,11 @@ def run_experiment(
             continue
 
         # Обработка изображения
-        num_targets, num_success_real, num_success_black, img_drops_real, img_drops_black, _ = detect_and_compare(
+        (num_targets,
+         num_success_real, num_success_black,
+         img_drops_real, img_drops_black,
+         _,
+         distances, successful_real_distances, successful_black_distances) = detect_and_compare(
             model=model,
             img=img,
             orig_img=img.copy(),
@@ -379,6 +429,9 @@ def run_experiment(
         successful_attacks_black += num_success_black
         confidence_drops_real.extend(img_drops_real)
         confidence_drops_black.extend(img_drops_black)
+        all_distances.extend(distances)
+        all_successful_real_distances.extend(successful_real_distances)
+        all_successful_black_distances.extend(successful_black_distances)
         '''
         if num_targets > 0:
             print(f"Processed {os.path.basename(image_file)}: "
@@ -397,7 +450,7 @@ def run_experiment(
         'successful_attacks_real': successful_attacks_real,
         'successful_attacks_black': successful_attacks_black,
         'target_class': target_class,
-        'target_class_name': class_names[target_class] if target_class < len(class_names) else 'unknown'
+        'target_class_name': class_names[target_class] if target_class < len(class_names) else 'unknown',
     }
 
     if total_targets > 0:
@@ -408,6 +461,9 @@ def run_experiment(
             np.mean(confidence_drops_black)) if confidence_drops_black else 0.0
         metrics['relative_effectiveness'] = metrics['asr_real'] - metrics['asr_black']
         metrics['conf_drop'] = metrics['mean_confidence_drop_real'] - metrics['mean_confidence_drop_black']
+        metrics['mean_distance'] = np.mean(all_distances)
+        metrics['mean_successful_real_dist'] = np.mean(all_successful_real_distances)
+        metrics['mean_successful_black_dist'] = np.mean(all_successful_black_distances)
     else:
         metrics['asr_real'] = 0.0
         metrics['asr_black'] = 0.0
@@ -415,6 +471,9 @@ def run_experiment(
         metrics['mean_confidence_drop_black'] = 0.0
         metrics['relative_effectiveness'] = 0.0
         metrics['conf_drop'] = 0.0
+        metrics['mean_distance'] = 0.0
+        metrics['mean_successful_real_dist'] = 0.0
+        metrics['mean_successful_black_dist'] = 0.0
 
     # Сохранение результатов в файл
     json_results_path = 'results'
@@ -444,6 +503,6 @@ if __name__ == "__main__":
                              save_images=True,
                              out_of_box=True,
                              patch_size=1,
-                             location=(-1,-1)
+                             location=(0,0)
                              )
     [print(f"{key}: {value}") for key, value in metrics.items()]
