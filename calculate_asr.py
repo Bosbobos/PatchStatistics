@@ -13,7 +13,6 @@ def apply_patch(
         img: np.ndarray,
         boxes: np.ndarray,
         class_ids: np.ndarray,
-        target_class: int,
         patch: np.ndarray,
         patch_size: float,
         out_of_box: bool = False,
@@ -26,7 +25,6 @@ def apply_patch(
     :param img: исходное изображение
     :param boxes: координаты объектов
     :param class_ids: классы объектов
-    :param target_class: целевой класс для атаки
     :param patch_path: путь к файлу патча
     :param patch_size: относительный размер патча
     :return: изображение с наложенными патчами
@@ -44,10 +42,9 @@ def apply_patch(
             w = img.shape[1] - patch_width
         patched[h:h+patch_height, w:w+patch_width] = patch_resized
         return patched, [w, h, w+patch_width, h+patch_height]
+    # target_indices -> class_ids
 
-    target_indices = np.where(class_ids == target_class)[0]
-
-    for i in target_indices:
+    for i in range(len(class_ids)):
         x1, y1, x2, y2 = map(int, boxes[i])
         width = int(x2 - x1)
         height = int(y2 - y1)
@@ -117,7 +114,6 @@ def detect_and_compare(
         orig_img: np.ndarray,
         patch_path: str,
         model_params: Dict[str, Any],
-        target_class: int = 0,
         patch_size: float = 0.4,
         threshold: float = 0.3,
         save_images: bool = True,
@@ -169,7 +165,7 @@ def detect_and_compare(
 
     # Применяем настоящий патч к целевым объектам
     patched_img, patch_square = apply_patch(
-        img, boxes, class_ids, target_class, patch, patch_size, out_of_box, near_box, location
+        img, boxes, class_ids, patch, patch_size, out_of_box, near_box, location
     )
 
     black_patch_path = 'black_patch.png'
@@ -178,7 +174,7 @@ def detect_and_compare(
         raise FileNotFoundError(f"Patch file not found: {patch_path}")
     # Применяем черный патч к целевым объектам
     black_patched_img, black_patch_square = apply_patch(
-        img, boxes, class_ids, target_class, black_patch, patch_size, out_of_box, near_box, location
+        img, boxes, class_ids, black_patch, patch_size, out_of_box, near_box, location
     )
 
     # Детекция на изображении с настоящим патчем
@@ -220,12 +216,15 @@ def detect_and_compare(
     successful_real_distances = []
     successful_black_distances = []
 
-    target_indices = np.where(class_ids == target_class)[0]
-    num_targets = len(target_indices)
+    #target_indices = np.where(class_ids == target_class)[0]
+    num_targets = len(class_ids)
 
-    for idx in target_indices:
+    for idx in range(num_targets):
+        class_id = class_ids[idx]
+        orig_score = scores_all[idx, class_id] if scores_all.size > 0 and idx < len(scores_all) else 0
+        if orig_score < conf_threshold:
+            continue
         orig_box = boxes[idx]
-        orig_score = scores_all[idx, target_class] if scores_all.size > 0 and idx < len(scores_all) else 0
 
         if patch_square is not None:
             dist = distance_between_squares(orig_box, patch_square)
@@ -237,24 +236,23 @@ def detect_and_compare(
         success = False
         found_real = False
         for j, patched_box in enumerate(boxes_p):
-            if class_ids_p[j] == target_class:
-                iou = calculate_iou(orig_box, patched_box)
-                if iou > 0.5:
-                    found_real = True
-                    patched_score = scores_all_p[j, target_class] if scores_all_p.size > 0 and j < len(
-                        scores_all_p) else 0
-                    confidence_drop = orig_score - patched_score
-                    confidence_drops_real.append(confidence_drop)
+            iou = calculate_iou(orig_box, patched_box)
+            if iou > 0.5:
+                found_real = True
+                patched_score = scores_all_p[j, class_id] if scores_all_p.size > 0 and j < len(
+                    scores_all_p) else 0
+                confidence_drop = orig_score - patched_score
+                confidence_drops_real.append(confidence_drop)
 
-                    if orig_score > threshold and patched_score < threshold:
-                        success = True
-                        num_success_real += 1
-                        if patch_square is not None:
-                            dist = distance_between_squares(orig_box, patch_square)
-                        else:
-                            dist = 0
-                        successful_real_distances.append(dist)
-                    break
+                if orig_score > threshold and patched_score < threshold:
+                    success = True
+                    num_success_real += 1
+                    if patch_square is not None:
+                        dist = distance_between_squares(orig_box, patch_square)
+                    else:
+                        dist = 0
+                    successful_real_distances.append(dist)
+                break
 
         if not found_real:
             confidence_drops_real.append(orig_score)
@@ -270,11 +268,11 @@ def detect_and_compare(
         # Проверяем эффективность черного патча
         found_black = False
         for j, black_patched_box in enumerate(boxes_bp):
-            if class_ids_bp[j] == target_class:
+            if class_ids_bp[j] == class_id:
                 iou = calculate_iou(orig_box, black_patched_box)
                 if iou > 0.5:
                     found_black = True
-                    black_patched_score = scores_all_bp[j, target_class] if scores_all_bp.size > 0 and j < len(
+                    black_patched_score = scores_all_bp[j, class_id] if scores_all_bp.size > 0 and j < len(
                         scores_all_bp) else 0
                     confidence_drop = orig_score - black_patched_score
                     confidence_drops_black.append(confidence_drop)
@@ -300,7 +298,7 @@ def detect_and_compare(
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
-    if save_images:
+    if save_images and success:
         # Создание директории для результатов
         os.makedirs(save_dir, exist_ok=True)
 
@@ -337,7 +335,6 @@ def run_experiment(
         patch_size: float = 0.4,
         patch_name: str = "dpatch5000",
         results_dir: Optional[str] = None,
-        target_class: int = 0,
         save_images: bool = True,
         out_of_box: bool = False,
         near_box: bool = False,
@@ -413,7 +410,6 @@ def run_experiment(
             orig_img=img.copy(),
             patch_path=patch_path,
             model_params=model_params,
-            target_class=target_class,
             patch_size=patch_size,
             save_images=save_images,
             save_dir=results_dir,
@@ -449,8 +445,6 @@ def run_experiment(
         'total_targets': total_targets,
         'successful_attacks_real': successful_attacks_real,
         'successful_attacks_black': successful_attacks_black,
-        'target_class': target_class,
-        'target_class_name': class_names[target_class] if target_class < len(class_names) else 'unknown',
     }
 
     if total_targets > 0:
