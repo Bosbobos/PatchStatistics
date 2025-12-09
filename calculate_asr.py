@@ -9,6 +9,7 @@ from Geometry import distance_between_squares
 from Models import *
 from Auxiliary import *
 
+
 def apply_patch(
         img: np.ndarray,
         boxes: np.ndarray,
@@ -18,7 +19,7 @@ def apply_patch(
         patch_size: float,
         out_of_box: bool = False,
         near_box: bool = False,
-        location=(0,0)
+        location=(0, 0)
 ) -> tuple[ndarray, list[tuple[int, int] | Any]] | tuple[ndarray, None]:
     """
     Применяет патч к объектам целевого класса на изображении
@@ -42,8 +43,8 @@ def apply_patch(
             h = img.shape[0] - patch_height
         if w == -1:
             w = img.shape[1] - patch_width
-        patched[h:h+patch_height, w:w+patch_width] = patch_resized
-        return patched, [w, h, w+patch_width, h+patch_height]
+        patched[h:h + patch_height, w:w + patch_width] = patch_resized
+        return patched, [w, h, w + patch_width, h + patch_height]
 
     target_indices = np.where(class_ids == target_class)[0]
 
@@ -111,6 +112,7 @@ def apply_patch(
 
     return patched, None
 
+
 def detect_and_compare(
         model: Any,
         img: np.ndarray,
@@ -125,7 +127,10 @@ def detect_and_compare(
         img_name: Optional[str] = None,
         out_of_box: bool = False,
         near_box: bool = False,
-        location=(0, 0)
+        location=(0, 0),
+        patch_to_box_min_dist: float = -1.0,
+        confidence_threshold: float = -1.0,
+        top_k: int = -1,
 ) -> tuple[
     int, int | Any, int | Any, list[Any], list[Any], ndarray[Any, dtype[Any]] | None, list[Any], list[Any], list[Any]]:
     """
@@ -167,18 +172,71 @@ def detect_and_compare(
     if patch is None:
         raise FileNotFoundError(f"Patch file not found: {patch_path}")
 
-    # Применяем настоящий патч к целевым объектам
+    # Calculate patch_square for filtering (need to know patch location before filtering)
+    patch_square = None
+    if out_of_box:
+        patch_width = max(5, int(patch.shape[1] * patch_size))
+        patch_height = max(5, int(patch.shape[0] * patch_size))
+        w, h = location
+        if h == -1:
+            h = img.shape[0] - patch_height
+        if w == -1:
+            w = img.shape[1] - patch_width
+        patch_square = [w, h, w + patch_width, h + patch_height]
+
+    # Filter detections based on patch_to_box_min_dist, confidence_threshold, and top_k
+    # This filtering happens BEFORE patch application and affects which boxes are counted
+    target_indices = np.where(class_ids == target_class)[0]
+
+    if patch_square is not None and (patch_to_box_min_dist >= 0 or confidence_threshold >= 0 or top_k >= 0):
+        # Calculate distances and scores for all target objects
+        target_data = []
+        for idx in target_indices:
+            orig_box = boxes[idx]
+            dist = distance_between_squares(orig_box, patch_square)
+            orig_score = scores_all[idx, target_class] if scores_all.size > 0 and idx < len(scores_all) else 0
+            target_data.append((idx, dist, orig_score))
+
+        # Filter by minimum distance
+        if patch_to_box_min_dist >= 0:
+            target_data = [(idx, dist, score) for idx, dist, score in target_data if dist > patch_to_box_min_dist]
+
+        # Filter by minimum confidence threshold
+        if confidence_threshold >= 0:
+            target_data = [(idx, dist, score) for idx, dist, score in target_data if score >= confidence_threshold]
+
+        # Sort by confidence (descending) and take top_k
+        if top_k >= 0 and len(target_data) > top_k:
+            target_data.sort(key=lambda x: x[2], reverse=True)
+            target_data = target_data[:top_k]
+
+        filtered_indices = np.array([idx for idx, _, _ in target_data]) if target_data else np.array([], dtype=int)
+    else:
+        filtered_indices = target_indices
+
+    # Create filtered versions of detection arrays (only include filtered target objects)
+    # For visualization and patch application, we only want to show/process the filtered target objects
+    filtered_target_mask = np.zeros(len(class_ids), dtype=bool)
+    if len(filtered_indices) > 0:
+        filtered_target_mask[filtered_indices] = True
+
+    boxes_filtered = boxes[filtered_target_mask]
+    scores_filtered = scores[filtered_target_mask]
+    class_ids_filtered = class_ids[filtered_target_mask]
+    scores_all_filtered = scores_all[filtered_target_mask] if scores_all.size > 0 else scores_all
+
+    # Применяем настоящий патч к целевым объектам (using filtered detections)
     patched_img, patch_square = apply_patch(
-        img, boxes, class_ids, target_class, patch, patch_size, out_of_box, near_box, location
+        img, boxes_filtered, class_ids_filtered, target_class, patch, patch_size, out_of_box, near_box, location
     )
 
     black_patch_path = 'black_patch.png'
     black_patch = cv2.imread(black_patch_path, cv2.IMREAD_UNCHANGED)
     if black_patch is None:
         raise FileNotFoundError(f"Patch file not found: {patch_path}")
-    # Применяем черный патч к целевым объектам
+    # Применяем черный патч к целевым объектам (using filtered detections)
     black_patched_img, black_patch_square = apply_patch(
-        img, boxes, class_ids, target_class, black_patch, patch_size, out_of_box, near_box, location
+        img, boxes_filtered, class_ids_filtered, target_class, black_patch, patch_size, out_of_box, near_box, location
     )
 
     # Детекция на изображении с настоящим патчем
@@ -216,14 +274,14 @@ def detect_and_compare(
     num_success_black = 0  # Успехи с черным патчем
     confidence_drops_real = []  # Падение уверенности с настоящим патчем
     confidence_drops_black = []  # Падение уверенности с черным патчем
-    all_distances = [] # Расстояния от патча до объекта (считается между двумя ближайшими точками)
+    all_distances = []  # Расстояния от патча до объекта (считается между двумя ближайшими точками)
     successful_real_distances = []
     successful_black_distances = []
 
-    target_indices = np.where(class_ids == target_class)[0]
-    num_targets = len(target_indices)
+    # Use the pre-filtered indices from earlier
+    num_targets = len(filtered_indices)
 
-    for idx in target_indices:
+    for idx in filtered_indices:
         orig_box = boxes[idx]
         orig_score = scores_all[idx, target_class] if scores_all.size > 0 and idx < len(scores_all) else 0
 
@@ -304,10 +362,49 @@ def detect_and_compare(
         # Создание директории для результатов
         os.makedirs(save_dir, exist_ok=True)
 
-        # Визуализация результатов
-        vis_clean = draw(orig_img.copy(), boxes, scores, class_ids, class_names)
-        vis_patched = draw(patched_img.copy(), boxes_p, scores_p, class_ids_p, class_names)
-        vis_black_patched = draw(black_patched_img.copy(), boxes_bp, scores_bp, class_ids_bp, class_names)
+        # Визуализация результатов (use filtered boxes for original image)
+        vis_clean = draw(orig_img.copy(), boxes_filtered, scores_filtered, class_ids_filtered, class_names)
+
+        # For patched images, only show boxes that match the original filtered boxes (by IoU > 0.5)
+        matched_boxes_p = []
+        matched_scores_p = []
+        matched_class_ids_p = []
+        for idx in filtered_indices:
+            orig_box = boxes[idx]
+            for j, patched_box in enumerate(boxes_p):
+                if class_ids_p[j] == target_class:
+                    iou = calculate_iou(orig_box, patched_box)
+                    if iou > 0.5:
+                        matched_boxes_p.append(patched_box)
+                        matched_scores_p.append(scores_p[j])
+                        matched_class_ids_p.append(class_ids_p[j])
+                        break
+
+        matched_boxes_bp = []
+        matched_scores_bp = []
+        matched_class_ids_bp = []
+        for idx in filtered_indices:
+            orig_box = boxes[idx]
+            for j, black_patched_box in enumerate(boxes_bp):
+                if class_ids_bp[j] == target_class:
+                    iou = calculate_iou(orig_box, black_patched_box)
+                    if iou > 0.5:
+                        matched_boxes_bp.append(black_patched_box)
+                        matched_scores_bp.append(scores_bp[j])
+                        matched_class_ids_bp.append(class_ids_bp[j])
+                        break
+
+        vis_patched = draw(patched_img.copy(),
+                           np.array(matched_boxes_p) if matched_boxes_p else np.array([]).reshape(0, 4),
+                           np.array(matched_scores_p) if matched_scores_p else np.array([]),
+                           np.array(matched_class_ids_p) if matched_class_ids_p else np.array([]),
+                           class_names)
+
+        vis_black_patched = draw(black_patched_img.copy(),
+                                 np.array(matched_boxes_bp) if matched_boxes_bp else np.array([]).reshape(0, 4),
+                                 np.array(matched_scores_bp) if matched_scores_bp else np.array([]),
+                                 np.array(matched_class_ids_bp) if matched_class_ids_bp else np.array([]),
+                                 class_names)
 
         # Добавляем подписи
         cv2.putText(vis_clean, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -328,6 +425,7 @@ def detect_and_compare(
             result_img,
             all_distances, successful_real_distances, successful_black_distances)
 
+
 def run_experiment(
         model_path: str = "nanodet.onnx",
         image_dir: str = "dataset",
@@ -342,7 +440,10 @@ def run_experiment(
         out_of_box: bool = False,
         near_box: bool = False,
         model_backend: str = 'ultralytics',  # 'ultralytics', 'yolov5_hub' или 'pytorchyolo',
-        location=(0,0)
+        location=(0, 0),
+        patch_to_box_min_dist: float = -1.0,
+        confidence_threshold: float = -1.0,
+        top_k: int = -1,
 ) -> Dict[str, Any]:
     # Вычисляем производные пути
     patch_path = f"{patch_name}.png"
@@ -420,7 +521,10 @@ def run_experiment(
             img_name=os.path.basename(image_file),
             out_of_box=out_of_box,
             near_box=near_box,
-            location=location
+            location=location,
+            patch_to_box_min_dist=patch_to_box_min_dist,
+            confidence_threshold=confidence_threshold,
+            top_k=top_k
         )
 
         # Обновляем статистику
@@ -503,6 +607,9 @@ if __name__ == "__main__":
                              save_images=True,
                              out_of_box=True,
                              patch_size=1,
-                             location=(0,0)
+                             location=(0, 0),
+                             patch_to_box_min_dist=0.0,
+                             confidence_threshold=0.85,
+                             top_k=1
                              )
     [print(f"{key}: {value}") for key, value in metrics.items()]
