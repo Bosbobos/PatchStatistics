@@ -358,7 +358,7 @@ def detect_and_compare(
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
-    if save_images:
+    if save_images and num_targets > 0:
         # Создание директории для результатов
         os.makedirs(save_dir, exist_ok=True)
 
@@ -413,9 +413,16 @@ def detect_and_compare(
 
         result_img = np.hstack([vis_clean, vis_patched, vis_black_patched])
 
+        pos = ''
+        if out_of_box:
+            pos = 'l_' if location[0] == 0 else 'r_' if location[0] == -1 else f'{location[0]}_'
+            pos += 'u' if location[1] == 0 else 'd' if location[1] == -1 else f'{location[1]}_'
+        
+        splitted = os.path.splitext(img_name)
+        filename = f"{splitted[0]}_{pos}{splitted[1]}"
         result_path = os.path.join(
             save_dir,
-            f"result_{os.path.basename(img_name)}"
+            f"result_{filename}"
         )
         cv2.imwrite(result_path, result_img)
 
@@ -610,6 +617,48 @@ if __name__ == "__main__":
                              location=(0, 0),
                              patch_to_box_min_dist=0.0,
                              confidence_threshold=0.85,
-                             top_k=1
+                             top_k=2
+                             )
+    [print(f"{key}: {value}") for key, value in metrics.items()]
+
+    metrics = run_experiment('yolo11s.pt',
+                             'inria_test',
+                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
+                             patch_name='0709_yolo_dpatch_1000',
+                             save_images=True,
+                             out_of_box=True,
+                             patch_size=1,
+                             location=(0, -1),
+                             patch_to_box_min_dist=0.0,
+                             confidence_threshold=0.85,
+                             top_k=2
+                             )
+    [print(f"{key}: {value}") for key, value in metrics.items()]
+
+    metrics = run_experiment('yolo11s.pt',
+                             'inria_test',
+                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
+                             patch_name='0709_yolo_dpatch_1000',
+                             save_images=True,
+                             out_of_box=True,
+                             patch_size=1,
+                             location=(-1, 0),
+                             patch_to_box_min_dist=0.0,
+                             confidence_threshold=0.85,
+                             top_k=2
+                             )
+    [print(f"{key}: {value}") for key, value in metrics.items()]
+
+    metrics = run_experiment('yolo11s.pt',
+                             'inria_test',
+                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
+                             patch_name='0709_yolo_dpatch_1000',
+                             save_images=True,
+                             out_of_box=True,
+                             patch_size=1,
+                             location=(-1, -1),
+                             patch_to_box_min_dist=0.0,
+                             confidence_threshold=0.85,
+                             top_k=2
                              )
     [print(f"{key}: {value}") for key, value in metrics.items()]
