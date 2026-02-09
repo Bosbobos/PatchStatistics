@@ -186,9 +186,9 @@ def evaluate_model_metrics(
 
 if __name__ == '__main__':
     yolo_results = evaluate_model_metrics(
-        model_path='yolov5s.pt',
-        data_dir='inria_test',
-        conf_threshold=0.3,
+        model_path='yolo11s.pt',
+        data_dir='../PatchSuccessResearch/datasets/segmented_1k',
+        conf_threshold=0.25,
         target_class=0
     )
     [print(f"{key}: {value}") for key, value in yolo_results.items()]

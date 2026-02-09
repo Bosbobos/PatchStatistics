@@ -25,3 +25,41 @@ def distance_between_squares(square1_bbox, square2_bbox):
     width2 = square2_bbox[2] - square2_bbox[0]
     height2 = square2_bbox[3] - square2_bbox[1]
     return distance_between_bboxes(square1_bbox, square2_bbox)
+
+
+def distance_from_bbox_edge_to_point(bbox, point):
+    """
+    Calculate the distance from the edge of a bounding box to a point.
+    If the point is inside the bbox, returns 0.
+    
+    :param bbox: [xmin, ymin, xmax, ymax]
+    :param point: (x, y)
+    :return: distance from bbox edge to point
+    """
+    x, y = point
+    xmin, ymin, xmax, ymax = bbox
+    
+    # Check if point is inside bbox
+    if xmin <= x <= xmax and ymin <= y <= ymax:
+        return 0.0
+    
+    # Calculate distance to closest edge
+    dx = max(xmin - x, 0, x - xmax)
+    dy = max(ymin - y, 0, y - ymax)
+    
+    return math.sqrt(dx**2 + dy**2)
+
+
+def distance_from_patch_to_bbox_center(patch_bbox, target_bbox):
+    """
+    Calculate the distance from the edge of the patch to the center of the target bbox.
+    
+    :param patch_bbox: [xmin, ymin, xmax, ymax] of the patch
+    :param target_bbox: [xmin, ymin, xmax, ymax] of the target object
+    :return: distance from patch edge to target center
+    """
+    # Calculate center of target bbox
+    center_x = (target_bbox[0] + target_bbox[2]) / 2
+    center_y = (target_bbox[1] + target_bbox[3]) / 2
+    
+    return distance_from_bbox_edge_to_point(patch_bbox, (center_x, center_y))

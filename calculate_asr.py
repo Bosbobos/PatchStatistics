@@ -1,13 +1,40 @@
 import json
 import os
-from typing import Any
+from typing import Any, Dict, Optional
 
+# Enable fallback to CPU for ops not implemented on MPS
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import torch
 from numpy import ndarray, dtype
 from tqdm import tqdm
 
-from Geometry import distance_between_squares
+from Geometry import distance_between_squares, distance_from_patch_to_bbox_center
 from Models import *
 from Auxiliary import *
+
+
+# Helper to select torch device
+def get_torch_device(requested: str = "auto") -> tuple[torch.device, str]:
+    """Return (torch.device, device_str) where device_str is compatible with Ultralytics."""
+    req = (requested or "auto").lower()
+
+    if req in {"mps", "apple", "metal"}:
+        if torch.backends.mps.is_available():
+            return torch.device("mps"), "mps"
+        return torch.device("cpu"), "cpu"
+
+    if req in {"cuda", "gpu"}:
+        if torch.cuda.is_available():
+            return torch.device("cuda"), "cuda"
+        return torch.device("cpu"), "cpu"
+
+    # auto
+    if torch.backends.mps.is_available():
+        return torch.device("mps"), "mps"
+    if torch.cuda.is_available():
+        return torch.device("cuda"), "cuda"
+    return torch.device("cpu"), "cpu"
 
 
 def apply_patch(
@@ -131,6 +158,7 @@ def detect_and_compare(
         patch_to_box_min_dist: float = -1.0,
         confidence_threshold: float = -1.0,
         top_k: int = -1,
+        device: Optional[torch.device] = None,
 ) -> tuple[
     int, int | Any, int | Any, list[Any], list[Any], ndarray[Any, dtype[Any]] | None, list[Any], list[Any], list[Any]]:
     """
@@ -151,19 +179,33 @@ def detect_and_compare(
     # Определяем бэкенд YOLO (по умолчанию 'ultralytics' для обратной совместимости)
     model_backend_type = model_params.get('model_backend_type', 'yolo_ultralytics')
 
+    # Torch device for inference (CPU/CUDA/MPS)
+    if device is None:
+        device = model_params.get('torch_device', torch.device('cpu'))
+
     orig_h, orig_w = img.shape[:2]
 
     # Детекция на исходном изображении
     if model_type == 'yolo':
         if model_backend_type == 'yolo_ultralytics':
-            boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold)
+            try:
+                boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold, device=str(device))
+            except TypeError:
+                boxes, scores, class_ids, scores_all = yolo_detect(model, img, conf_threshold)
         elif model_backend_type == 'yolo_hub':
-            boxes, scores, class_ids, scores_all = yolo_hub_detect(model, img, conf_threshold, num_classes)
+            try:
+                boxes, scores, class_ids, scores_all = yolo_hub_detect(model, img, conf_threshold, num_classes, device=str(device))
+            except TypeError:
+                boxes, scores, class_ids, scores_all = yolo_hub_detect(model, img, conf_threshold, num_classes)
         elif model_backend_type == 'yolo_pytorchyolo':
-            boxes, scores, class_ids, scores_all = yolo_pytorchyolo_detect(model, img, conf_threshold, num_classes)
+            try:
+                boxes, scores, class_ids, scores_all = yolo_pytorchyolo_detect(model, img, conf_threshold, num_classes, device=str(device))
+            except TypeError:
+                boxes, scores, class_ids, scores_all = yolo_pytorchyolo_detect(model, img, conf_threshold, num_classes)
     else:  # onnx
         blob = preprocess(img, (H, W), mean, scale)
-        pred = model(torch.from_numpy(blob))[0].detach().numpy()
+        blob_t = torch.from_numpy(blob).to(device)
+        pred = model(blob_t)[0].detach().to('cpu').numpy()
         boxes, scores, class_ids, scores_all = postprocess(
             pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
         )
@@ -242,28 +284,52 @@ def detect_and_compare(
     # Детекция на изображении с настоящим патчем
     if model_type == 'yolo':
         if model_backend_type == 'yolo_ultralytics':
-            boxes_p, scores_p, class_ids_p, scores_all_p = yolo_detect(model, patched_img, conf_threshold)
-            boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_detect(model, black_patched_img, conf_threshold)
+            try:
+                boxes_p, scores_p, class_ids_p, scores_all_p = yolo_detect(model, patched_img, conf_threshold, device=str(device))
+            except TypeError:
+                boxes_p, scores_p, class_ids_p, scores_all_p = yolo_detect(model, patched_img, conf_threshold)
+            try:
+                boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_detect(model, black_patched_img, conf_threshold, device=str(device))
+            except TypeError:
+                boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_detect(model, black_patched_img, conf_threshold)
         elif model_backend_type == 'yolo_hub':
-            boxes_p, scores_p, class_ids_p, scores_all_p = yolo_hub_detect(model, patched_img, conf_threshold,
-                                                                           num_classes)
-            boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_hub_detect(model, black_patched_img, conf_threshold,
+            try:
+                boxes_p, scores_p, class_ids_p, scores_all_p = yolo_hub_detect(model, patched_img, conf_threshold,
+                                                                               num_classes, device=str(device))
+            except TypeError:
+                boxes_p, scores_p, class_ids_p, scores_all_p = yolo_hub_detect(model, patched_img, conf_threshold,
                                                                                num_classes)
-        elif model_backend_type == 'yolo_pytorchyolo':
-            boxes_p, scores_p, class_ids_p, scores_all_p = yolo_pytorchyolo_detect(model, patched_img, conf_threshold,
+            try:
+                boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_hub_detect(model, black_patched_img, conf_threshold,
+                                                                                   num_classes, device=str(device))
+            except TypeError:
+                boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_hub_detect(model, black_patched_img, conf_threshold,
                                                                                    num_classes)
-            boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_pytorchyolo_detect(model, black_patched_img,
-                                                                                       conf_threshold, num_classes)
+        elif model_backend_type == 'yolo_pytorchyolo':
+            try:
+                boxes_p, scores_p, class_ids_p, scores_all_p = yolo_pytorchyolo_detect(model, patched_img, conf_threshold,
+                                                                                       num_classes, device=str(device))
+            except TypeError:
+                boxes_p, scores_p, class_ids_p, scores_all_p = yolo_pytorchyolo_detect(model, patched_img, conf_threshold,
+                                                                                       num_classes)
+            try:
+                boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_pytorchyolo_detect(model, black_patched_img,
+                                                                                           conf_threshold, num_classes, device=str(device))
+            except TypeError:
+                boxes_bp, scores_bp, class_ids_bp, scores_all_bp = yolo_pytorchyolo_detect(model, black_patched_img,
+                                                                                           conf_threshold, num_classes)
 
     else:  # onnx
         blob = preprocess(patched_img, (H, W), mean, scale)
-        pred = model(torch.from_numpy(blob))[0].detach().numpy()
+        blob_t = torch.from_numpy(blob).to(device)
+        pred = model(blob_t)[0].detach().to('cpu').numpy()
         boxes_p, scores_p, class_ids_p, scores_all_p = postprocess(
             pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
         )
 
         blob = preprocess(black_patched_img, (H, W), mean, scale)
-        pred = model(torch.from_numpy(blob))[0].detach().numpy()
+        blob_t = torch.from_numpy(blob).to(device)
+        pred = model(blob_t)[0].detach().to('cpu').numpy()
         boxes_bp, scores_bp, class_ids_bp, scores_all_bp = postprocess(
             pred, (orig_h, orig_w), (H, W), strides, conf_threshold, num_classes
         )
@@ -274,7 +340,11 @@ def detect_and_compare(
     num_success_black = 0  # Успехи с черным патчем
     confidence_drops_real = []  # Падение уверенности с настоящим патчем
     confidence_drops_black = []  # Падение уверенности с черным патчем
-    all_distances = []  # Расстояния от патча до объекта (считается между двумя ближайшими точками)
+    confidence_drops_real_succ = []   # Только успешные (реальный патч)
+    confidence_drops_real_fail = []   # Только неуспешные (реальный патч)
+    confidence_drops_black_succ = []  # Только успешные (черный патч)
+    confidence_drops_black_fail = []  # Только неуспешные (черный патч)
+    all_distances = []  # Расстояния от края патча до центра объекта
     successful_real_distances = []
     successful_black_distances = []
 
@@ -286,13 +356,18 @@ def detect_and_compare(
         orig_score = scores_all[idx, target_class] if scores_all.size > 0 and idx < len(scores_all) else 0
 
         if patch_square is not None:
-            dist = distance_between_squares(orig_box, patch_square)
+            dist = distance_from_patch_to_bbox_center(patch_square, orig_box)
         else:
             dist = 0
         all_distances.append(dist)
 
+        # Track per-target drop values and success flags
+        real_drop_val = None
+        black_drop_val = None
+        success_real = False
+        success_black = False
+
         # Проверяем эффективность настоящего патча
-        success = False
         found_real = False
         for j, patched_box in enumerate(boxes_p):
             if class_ids_p[j] == target_class:
@@ -303,12 +378,13 @@ def detect_and_compare(
                         scores_all_p) else 0
                     confidence_drop = orig_score - patched_score
                     confidence_drops_real.append(confidence_drop)
+                    real_drop_val = confidence_drop
 
                     if orig_score > threshold and patched_score < threshold:
-                        success = True
+                        success_real = True
                         num_success_real += 1
                         if patch_square is not None:
-                            dist = distance_between_squares(orig_box, patch_square)
+                            dist = distance_from_patch_to_bbox_center(patch_square, orig_box)
                         else:
                             dist = 0
                         successful_real_distances.append(dist)
@@ -316,14 +392,22 @@ def detect_and_compare(
 
         if not found_real:
             confidence_drops_real.append(orig_score)
+            real_drop_val = orig_score
             if orig_score > threshold:
-                success = True
+                success_real = True
                 num_success_real += 1
                 if patch_square is not None:
-                    dist = distance_between_squares(orig_box, patch_square)
+                    dist = distance_from_patch_to_bbox_center(patch_square, orig_box)
                 else:
                     dist = 0
                 successful_real_distances.append(dist)
+
+        # Разносим conf drop по успешным/неуспешным (реальный патч)
+        if real_drop_val is not None:
+            if success_real:
+                confidence_drops_real_succ.append(real_drop_val)
+            else:
+                confidence_drops_real_fail.append(real_drop_val)
 
         # Проверяем эффективность черного патча
         found_black = False
@@ -336,11 +420,13 @@ def detect_and_compare(
                         scores_all_bp) else 0
                     confidence_drop = orig_score - black_patched_score
                     confidence_drops_black.append(confidence_drop)
+                    black_drop_val = confidence_drop
 
                     if orig_score > threshold and black_patched_score < threshold:
+                        success_black = True
                         num_success_black += 1
                         if black_patch_square is not None:
-                            dist = distance_between_squares(orig_box, black_patch_square)
+                            dist = distance_from_patch_to_bbox_center(black_patch_square, orig_box)
                         else:
                             dist = 0
                         successful_black_distances.append(dist)
@@ -348,13 +434,22 @@ def detect_and_compare(
 
         if not found_black:
             confidence_drops_black.append(orig_score)
+            black_drop_val = orig_score
             if orig_score > threshold:
+                success_black = True
                 num_success_black += 1
                 if black_patch_square is not None:
-                    dist = distance_between_squares(orig_box, black_patch_square)
+                    dist = distance_from_patch_to_bbox_center(black_patch_square, orig_box)
                 else:
                     dist = 0
                 successful_black_distances.append(dist)
+
+        # Разносим conf drop по успешным/неуспешным (черный патч)
+        if black_drop_val is not None:
+            if success_black:
+                confidence_drops_black_succ.append(black_drop_val)
+            else:
+                confidence_drops_black_fail.append(black_drop_val)
 
     # Создаем side-by-side изображение с тремя панелями
     result_img = None
@@ -417,7 +512,7 @@ def detect_and_compare(
         if out_of_box:
             pos = 'l_' if location[0] == 0 else 'r_' if location[0] == -1 else f'{location[0]}_'
             pos += 'u' if location[1] == 0 else 'd' if location[1] == -1 else f'{location[1]}_'
-        
+
         splitted = os.path.splitext(img_name)
         filename = f"{splitted[0]}_{pos}{splitted[1]}"
         result_path = os.path.join(
@@ -429,6 +524,8 @@ def detect_and_compare(
     return (num_targets,
             num_success_real, num_success_black,
             confidence_drops_real, confidence_drops_black,
+            confidence_drops_real_succ, confidence_drops_real_fail,
+            confidence_drops_black_succ, confidence_drops_black_fail,
             result_img,
             all_distances, successful_real_distances, successful_black_distances)
 
@@ -436,7 +533,7 @@ def detect_and_compare(
 def run_experiment(
         model_path: str = "nanodet.onnx",
         image_dir: str = "dataset",
-        samples_num: int = 300,
+        samples_num: int = 50000,
         classes_path: Optional[str] = None,
         conf_threshold: float = 0.3,
         patch_size: float = 0.4,
@@ -451,14 +548,21 @@ def run_experiment(
         patch_to_box_min_dist: float = -1.0,
         confidence_threshold: float = -1.0,
         top_k: int = -1,
+        device: str = "auto",
 ) -> Dict[str, Any]:
     # Вычисляем производные пути
     patch_path = f"{patch_name}.png"
     if results_dir is None:
         results_dir = f"patched_{patch_name}" + ('_oob' if out_of_box else "") + ('_near_box' if near_box else '')
 
+    # Choose device (prefer MPS on Apple Silicon)
+    torch_device, device_str = get_torch_device(device)
+
     # Загрузка модели
-    model_info, H, W, num_classes = load_model(model_path, model_backend=model_backend)
+    try:
+        model_info, H, W, num_classes = load_model(model_path, model_backend=model_backend, device=device_str)
+    except TypeError:
+        model_info, H, W, num_classes = load_model(model_path, model_backend=model_backend)
 
     # Определяем тип модели
     model_backend_type = 'onnx'  # По умолчанию
@@ -469,6 +573,16 @@ def run_experiment(
         # model (для ONNX)
         model = model_info
         model_type_str = 'onnx'
+
+    # Move torch models to the selected device (MPS/CUDA/CPU)
+    try:
+        if hasattr(model, 'to'):
+            model = model.to(torch_device)
+        if hasattr(model, 'eval'):
+            model.eval()
+    except Exception:
+        # Some wrappers (e.g., Ultralytics YOLO) manage device internally
+        pass
 
     # Загрузка имен классов
     class_names = load_class_names(classes_path)
@@ -486,7 +600,9 @@ def run_experiment(
         'num_classes': num_classes,
         'class_names': class_names,
         'model_type': model_type_str,  # 'yolo' или 'onnx'
-        'model_backend_type': model_backend_type  # 'yolo_ultralytics', 'yolo_hub', 'yolo_pytorchyolo' или 'onnx'
+        'model_backend_type': model_backend_type,  # 'yolo_ultralytics', 'yolo_hub', 'yolo_pytorchyolo' или 'onnx'
+        'torch_device': torch_device,
+        'device_str': device_str
     }
 
     # Статистика для обоих типов патчей
@@ -495,6 +611,10 @@ def run_experiment(
     successful_attacks_black = 0
     confidence_drops_real = []
     confidence_drops_black = []
+    confidence_drops_real_succ = []
+    confidence_drops_real_fail = []
+    confidence_drops_black_succ = []
+    confidence_drops_black_fail = []
     all_distances = []
     all_successful_real_distances = []
     all_successful_black_distances = []
@@ -514,6 +634,8 @@ def run_experiment(
         (num_targets,
          num_success_real, num_success_black,
          img_drops_real, img_drops_black,
+         img_drops_real_succ, img_drops_real_fail,
+         img_drops_black_succ, img_drops_black_fail,
          _,
          distances, successful_real_distances, successful_black_distances) = detect_and_compare(
             model=model,
@@ -531,7 +653,8 @@ def run_experiment(
             location=location,
             patch_to_box_min_dist=patch_to_box_min_dist,
             confidence_threshold=confidence_threshold,
-            top_k=top_k
+            top_k=top_k,
+            device=torch_device,
         )
 
         # Обновляем статистику
@@ -540,6 +663,10 @@ def run_experiment(
         successful_attacks_black += num_success_black
         confidence_drops_real.extend(img_drops_real)
         confidence_drops_black.extend(img_drops_black)
+        confidence_drops_real_succ.extend(img_drops_real_succ)
+        confidence_drops_real_fail.extend(img_drops_real_fail)
+        confidence_drops_black_succ.extend(img_drops_black_succ)
+        confidence_drops_black_fail.extend(img_drops_black_fail)
         all_distances.extend(distances)
         all_successful_real_distances.extend(successful_real_distances)
         all_successful_black_distances.extend(successful_black_distances)
@@ -568,6 +695,7 @@ def run_experiment(
         metrics['asr_real'] = successful_attacks_real / total_targets
         metrics['asr_black'] = successful_attacks_black / total_targets
         metrics['mean_confidence_drop_real'] = float(np.mean(confidence_drops_real)) if confidence_drops_real else 0.0
+        metrics['var_confidence_drop_real'] = float(np.var(confidence_drops_real)) if confidence_drops_real else 0.0
         metrics['mean_confidence_drop_black'] = float(
             np.mean(confidence_drops_black)) if confidence_drops_black else 0.0
         metrics['relative_effectiveness'] = metrics['asr_real'] - metrics['asr_black']
@@ -575,16 +703,26 @@ def run_experiment(
         metrics['mean_distance'] = np.mean(all_distances)
         metrics['mean_successful_real_dist'] = np.mean(all_successful_real_distances)
         metrics['mean_successful_black_dist'] = np.mean(all_successful_black_distances)
+        # Successful vs unsuccessful (real patch)
+        metrics['conf_drop_succ'] = float(np.mean(confidence_drops_real_succ)) if confidence_drops_real_succ else 0.0
+        metrics['conf_drop_succ_var'] = float(np.var(confidence_drops_real_succ)) if confidence_drops_real_succ else 0.0
+        metrics['conf_drop_fail'] = float(np.mean(confidence_drops_real_fail)) if confidence_drops_real_fail else 0.0
+        metrics['conf_drop_fail_var'] = float(np.var(confidence_drops_real_fail)) if confidence_drops_real_fail else 0.0
     else:
         metrics['asr_real'] = 0.0
         metrics['asr_black'] = 0.0
         metrics['mean_confidence_drop_real'] = 0.0
+        metrics['var_confidence_drop_real'] = 0.0
         metrics['mean_confidence_drop_black'] = 0.0
         metrics['relative_effectiveness'] = 0.0
         metrics['conf_drop'] = 0.0
         metrics['mean_distance'] = 0.0
         metrics['mean_successful_real_dist'] = 0.0
         metrics['mean_successful_black_dist'] = 0.0
+        metrics['conf_drop_succ'] = 0.0
+        metrics['conf_drop_succ_var'] = 0.0
+        metrics['conf_drop_fail'] = 0.0
+        metrics['conf_drop_fail_var'] = 0.0
 
     # Сохранение результатов в файл
     json_results_path = 'results'
@@ -607,58 +745,48 @@ if __name__ == "__main__":
 
     warnings.filterwarnings('ignore')
 
-    metrics = run_experiment('yolo11s.pt',
-                             'inria_test',
-                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
-                             patch_name='0709_yolo_dpatch_1000',
-                             save_images=True,
-                             out_of_box=True,
-                             patch_size=1,
-                             location=(0, 0),
-                             patch_to_box_min_dist=0.0,
-                             confidence_threshold=0.85,
-                             top_k=2
-                             )
-    [print(f"{key}: {value}") for key, value in metrics.items()]
+    patch_name = '0802_test_inria_15_500'
+    #dataset_name = '../PatchSuccessResearch/datasets/one_person_train'
+    #dataset_name = '../PatchSuccessResearch/datasets/segmented_1k/images'
+    dataset_name = 'inria_test'
 
-    metrics = run_experiment('yolo11s.pt',
-                             'inria_test',
-                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
-                             patch_name='0709_yolo_dpatch_1000',
-                             save_images=True,
-                             out_of_box=True,
-                             patch_size=1,
-                             location=(0, -1),
-                             patch_to_box_min_dist=0.0,
-                             confidence_threshold=0.85,
-                             top_k=2
-                             )
-    [print(f"{key}: {value}") for key, value in metrics.items()]
+    # Store results for table
+    results_table = []
+    locations = [(0, 0)]#, (0, -1), (-1, 0), (-1, -1)]
+    location_names = ['top-left']#, 'bottom-left', 'top-right', 'bottom-right']
 
-    metrics = run_experiment('yolo11s.pt',
-                             'inria_test',
-                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
-                             patch_name='0709_yolo_dpatch_1000',
-                             save_images=True,
-                             out_of_box=True,
-                             patch_size=1,
-                             location=(-1, 0),
-                             patch_to_box_min_dist=0.0,
-                             confidence_threshold=0.85,
-                             top_k=2
-                             )
-    [print(f"{key}: {value}") for key, value in metrics.items()]
-
-    metrics = run_experiment('yolo11s.pt',
-                             'inria_test',
-                             model_backend='ultralytics',  # Указываем, что хотим использовать оригинальный yolov5
-                             patch_name='0709_yolo_dpatch_1000',
-                             save_images=True,
-                             out_of_box=True,
-                             patch_size=1,
-                             location=(-1, -1),
-                             patch_to_box_min_dist=0.0,
-                             confidence_threshold=0.85,
-                             top_k=2
-                             )
-    [print(f"{key}: {value}") for key, value in metrics.items()]
+    for loc, loc_name in zip(locations, location_names):
+        metrics = run_experiment('yolo11s.pt',
+                                 dataset_name,
+                                 model_backend='ultralytics',
+                                 patch_name=patch_name,
+                                 save_images=True,
+                                 out_of_box=True,
+                                 patch_size=1,
+                                 location=loc,
+                                 patch_to_box_min_dist=0.0,
+                                 confidence_threshold=0.25,
+                                 top_k=1,
+                                 device='mps',
+                                 samples_num=500
+                                 )
+        results_table.append({
+            'position': loc_name,
+            'asr_real': metrics['asr_real'],
+            'conf_drop_real': metrics['mean_confidence_drop_real'],
+            'mean_dist': metrics['mean_distance'],
+            'mean_success_dist': metrics['mean_successful_real_dist']
+        })
+    
+    # Print results table (tab-separated for easy copy to Word)
+    print("\n" + "=" * 90)
+    print("Position\tASR Real\tConf Drop\tMean Dist\tMean Success Dist")
+    for row in results_table:
+        print(f'''{row['position']}
+Чистый ASR: {row['asr_real']:.4f}
+Чистый confidence drop: {row['conf_drop_real']:.4f}
+Средняя дистанция от патча до центра объекта: {row['mean_dist']:.2f}
+Средняя дистанция успешных атак: {row['mean_success_dist']:.2f}")
+\n
+''')
+    print("=" * 90)
